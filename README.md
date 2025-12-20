@@ -4,7 +4,6 @@ A VDA 5050 v2.1.0 compliant fleet management adapter that enables consumer vacuu
 
 ![VDA 5050](https://img.shields.io/badge/VDA%205050-v2.1.0-blue)
 ![Python](https://img.shields.io/badge/Python-3.8+-green)
-![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ## Overview
 
@@ -41,9 +40,9 @@ VDA 5050 is a standardized interface for communication between Automated Guided 
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                       BRIDGE                                │
-│                   (bridge_new.py)                           │
+│                   (bridge.py)                           │
 │  • Translates VDA 5050 → Valetudo HTTP API                  │
-│  • Polls robot position (0.5s interval)                     │
+│  • Polls robot position (e.g 2s interval)                     │
 │  • Executes navigation commands                             │
 └─────────────────────────┬───────────────────────────────────┘
                           │ HTTP REST API
@@ -60,9 +59,9 @@ VDA 5050 is a standardized interface for communication between Automated Guided 
 - Full v2.1.0 message format support
 - Order handling with nodes and edges
 - Base/Horizon traffic control mechanism
-- State publishing at 1-second intervals
+- State publishing at 2-second intervals
 - Connection state management (ONLINE/OFFLINE/CONNECTIONBROKEN)
-- Instant actions support (pause, resume, stop, cancel)
+- Instant actions support (pause, resume, stop)
 
 ### Navigation
 - Sequential waypoint navigation
@@ -75,18 +74,16 @@ VDA 5050 is a standardized interface for communication between Automated Guided 
 |--------|-------------|
 | `beep` | Play test sound |
 | `locate` | Play "find me" sound |
-| `setFanSpeed` | Set vacuum power (off/low/medium/high/turbo) |
+| `setFanSpeed` | Set vacuum power (low/medium/high/max) |
 | `setVolume` | Set speaker volume (0-100) |
 | `dock` | Return to charging station |
 | `startPause` | Pause current movement |
 | `stopPause` | Resume movement |
-| `cancelOrder` | Cancel entire order |
 
 ### GUI Dashboard
 - Real-time map visualization
 - Robot position tracking
 - Mission selection and execution
-- Manual control mode
 - Action execution panel
 - Log viewer
 
@@ -143,7 +140,7 @@ VDA 5050 is a standardized interface for communication between Automated Guided 
 
 5. **Configure robot IP**
    
-   Edit `bridge_new.py`:
+   Edit `bridge.py`:
    ```python
    VALETUDO_HOST = "192.168.178.69"  # Your robot's IP
    ```
@@ -154,7 +151,7 @@ VDA 5050 is a standardized interface for communication between Automated Guided 
 
 1. **Start the bridge** (connects to robot)
    ```bash
-   python bridge_new.py
+   python bridge.py
    ```
 
 2. **Start the backend** (in another terminal)
@@ -282,21 +279,22 @@ When `newBaseRequest: true` appears in state, the master control should send an 
 
 ```
 vda5050-fleet-management/
-├── vda_backend.py       # Main VDA 5050 backend controller
-├── bridge_new.py        # Valetudo HTTP API bridge
-├── vda_config.py        # Configuration (nodes, edges, MQTT)
-├── vda_gui.py           # Tkinter GUI dashboard
-├── actions_basic.py     # Action handlers
-├── mqtt_connection.py   # WebSocket MQTT helper
-├── vda5050.db          # SQLite database (optional)
-├── requirements.txt     # Python dependencies
-└── README.md           # This file
+├── vda_backend.py          # Main VDA 5050 backend controller
+├── bridge.py               # Valetudo HTTP API bridge
+├── vda_config.py           # Configuration (nodes, edges, MQTT)
+├── vda_gui.py              # Tkinter GUI dashboard
+├── actions_basic.py        # Action handlers
+├── actions_navigation.py   # goTo handler
+├── mqtt_connection.py      # WebSocket MQTT helper
+├── vda5050.db              # SQLite database (optional)
+├── requirements.txt        # Python dependencies
+└── README.md               # This file
 ```
 
 ## Troubleshooting
 
 ### Robot not responding
-- Check robot IP address in `bridge_new.py`
+- Check robot IP address in `bridge.py`
 - Verify Valetudo is running: `http://ROBOT_IP/api/v2/robot/state`
 - Ensure robot is on same network
 
@@ -314,15 +312,13 @@ vda5050-fleet-management/
 
 Contributions are welcome! Please feel free to submit issues and pull requests.
 
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Acknowledgments
 
 - [VDA 5050 Specification](https://github.com/VDA5050/VDA5050)
 - [Valetudo](https://valetudo.cloud/) - Open source cloud replacement for vacuum robots
 - Flexus GmbH - Industrial fleet management partner
+- THWS, Schweinfurt - Project Initiator
 
 ## Contact
 
