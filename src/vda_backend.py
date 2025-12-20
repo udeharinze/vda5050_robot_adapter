@@ -17,6 +17,7 @@ import json
 import time
 import math
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 import paho.mqtt.client as mqtt
@@ -32,9 +33,9 @@ from vda_config import (
 COMMAND_COOLDOWN_SEC = NAV.COMMAND_COOLDOWN_SEC
 STALLED_TIMEOUT_SEC = NAV.STALL_TIMEOUT_SEC
 ARRIVAL_TOLERANCE_MM = NAV.POSITION_TOLERANCE_MM
-STATE_PUBLISH_INTERVAL = 1.0        # Publish state every second
-CONNECTION_PUBLISH_INTERVAL = 1.0   # Publish connection every second
-ACTION_TIMEOUT_SEC = 10.0           # Timeout for actions like beep/locate
+STATE_PUBLISH_INTERVAL = 1.0  # Publish state every second
+CONNECTION_PUBLISH_INTERVAL = 1.0  # Publish connection every second
+ACTION_TIMEOUT_SEC = 10.0  # Timeout for actions like beep/locate
 
 # ============================================================================
 # MQTT TOPICS
@@ -48,6 +49,7 @@ TOPIC_CONNECTION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/connection"
 TOPIC_BRIDGE_STATE = "vda5050/robot/state"
 TOPIC_BRIDGE_ACTION = "vda5050/robot/instantAction"
 
+
 # ============================================================================
 # DATA CLASSES
 # ============================================================================
@@ -60,7 +62,7 @@ class ActionState:
     actionStatus: str = "WAITING"  # WAITING, INITIALIZING, RUNNING, PAUSED, FINISHED, FAILED
     actionDescription: str = ""
     resultDescription: str = ""
-    
+
     def to_dict(self) -> Dict:
         return {
             "actionId": self.actionId,
@@ -69,6 +71,7 @@ class ActionState:
             "actionDescription": self.actionDescription,
             "resultDescription": self.resultDescription
         }
+
 
 @dataclass
 class NodeState:
@@ -88,6 +91,7 @@ class NodeState:
             result["nodePosition"] = self.nodePosition
         return result
 
+
 @dataclass
 class EdgeState:
     edgeId: str
@@ -106,6 +110,7 @@ class EdgeState:
             "endNodeId": self.endNodeId
         }
 
+
 # ============================================================================
 # ROBOT BACKEND CLASS
 # ============================================================================
@@ -123,12 +128,12 @@ class RobotBackend:
         # Robot state - Initialize at home position
         home_x = NODES.get("home", {}).get("x", 0.0)
         home_y = NODES.get("home", {}).get("y", 0.0)
-        
+
         self.pose = {"x": home_x, "y": home_y, "theta": 0.0}
         self.display_pose = {"x": home_x, "y": home_y, "theta": 0.0}
         self.anim_start_pose = {"x": home_x, "y": home_y, "theta": 0.0}
         self.anim_start_time = 0.0
-        
+
         self.battery = 1.0
         self.charging = False
         self.is_driving = False
@@ -138,7 +143,7 @@ class RobotBackend:
         self.current_order: Optional[Dict] = None
         self.order_id = ""
         self.order_update_id = 0
-        self.last_node_id = "home"
+        self.last_node_id = None  # Will be set on first command based on actual position
         self.last_node_sequence_id = 0
 
         # Node/Edge states
@@ -172,9 +177,12 @@ class RobotBackend:
 
         # Threading
         self.lock = threading.RLock()
-        
+
         # Error tracking
         self.errors: List[Dict] = []
+
+        # Initial position sync flag - to detect robot's actual position on startup
+        self._initial_position_synced = False
 
     # ========================================================================
     # MQTT SETUP
@@ -186,7 +194,7 @@ class RobotBackend:
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
-        
+
         # Set last will for connection topic (OFFLINE when disconnected unexpectedly)
         last_will = {
             "headerId": 0,
@@ -209,6 +217,10 @@ class RobotBackend:
         except Exception as e:
             self.log(f"✗ MQTT connection failed: {e}", "error")
 
+    def connect(self):
+        """Alias for start() - for GUI compatibility"""
+        self.start()
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         """MQTT connection callback"""
         if reason_code == 0:
@@ -218,12 +230,13 @@ class RobotBackend:
                 self.log(f"📡 Order topic: {TOPIC_ORDER}", "info")
                 self.log(f"📡 State topic: {TOPIC_STATE}", "info")
                 self.log(f"📡 Connection topic: {TOPIC_CONNECTION}", "info")
+                self.log(f"📡 Instant Actions topic: {TOPIC_INSTANT_ACTIONS}", "info")
 
-            # Subscribe to topics
+                # Subscribe to topics
             client.subscribe(TOPIC_ORDER)
             client.subscribe(TOPIC_BRIDGE_STATE)
             client.subscribe(TOPIC_INSTANT_ACTIONS)
-            
+
             # Publish ONLINE connection state (with logging)
             self._publish_connection_state("ONLINE", log=True)
         else:
@@ -260,7 +273,7 @@ class RobotBackend:
         """Publish connection state (ONLINE, OFFLINE, CONNECTIONBROKEN)"""
         if not self.client:
             return
-            
+
         connection_msg = {
             "headerId": self._next_header_id(),
             "timestamp": self._get_timestamp(),
@@ -284,15 +297,18 @@ class RobotBackend:
             new_x = pos.get("x")
             new_y = pos.get("y")
             new_theta = pos.get("theta")
-            
+
             if new_x is not None and new_y is not None:
                 self.anim_start_pose = self.display_pose.copy()
                 self.anim_start_time = time.time()
-                
+
                 self.pose["x"] = new_x
                 self.pose["y"] = new_y
                 if new_theta is not None:
                     self.pose["theta"] = new_theta
+
+                # Mark that we've received at least one position update
+                self._initial_position_synced = True
 
         self.is_driving = payload.get("driving", False)
 
@@ -313,14 +329,170 @@ class RobotBackend:
         t = min(1.0, elapsed / NAV.ANIMATION_DURATION_SEC)
 
         self.display_pose["x"] = (
-            self.anim_start_pose["x"] +
-            (self.pose["x"] - self.anim_start_pose["x"]) * t
+                self.anim_start_pose["x"] +
+                (self.pose["x"] - self.anim_start_pose["x"]) * t
         )
         self.display_pose["y"] = (
-            self.anim_start_pose["y"] +
-            (self.pose["y"] - self.anim_start_pose["y"]) * t
+                self.anim_start_pose["y"] +
+                (self.pose["y"] - self.anim_start_pose["y"]) * t
         )
         self.display_pose["theta"] = self.pose["theta"]
+
+    # ========================================================================
+    # INITIAL POSITION SYNC & PATH FINDING
+    # ========================================================================
+
+    def _sync_initial_position(self):
+        """Sync last_node_id with robot's actual position on startup"""
+        nearest = self._find_nearest_node()
+        if nearest:
+            # Check if actually at this node (within tolerance)
+            node_data = NODES.get(nearest)
+            if node_data:
+                dist = math.sqrt(
+                    (self.pose["x"] - node_data["x"]) ** 2 +
+                    (self.pose["y"] - node_data["y"]) ** 2
+                )
+                if dist < ARRIVAL_TOLERANCE_MM:
+                    self.last_node_id = nearest
+                    self.log(f"📍 Initial position: at node '{nearest}'", "info")
+                else:
+                    self.last_node_id = nearest
+                    self.log(f"📍 Initial position: near node '{nearest}' (dist={dist:.0f}mm)", "info")
+        self._initial_position_synced = True
+
+    def _find_nearest_node(self) -> Optional[str]:
+        """Find the nearest defined node to robot's current position"""
+        if not self.pose:
+            return None
+
+        robot_x = self.pose.get("x", 0)
+        robot_y = self.pose.get("y", 0)
+
+        min_dist = float('inf')
+        nearest_node = None
+
+        for node_id, node_data in NODES.items():
+            node_x = node_data.get("x", 0)
+            node_y = node_data.get("y", 0)
+            dist = math.sqrt((robot_x - node_x) ** 2 + (robot_y - node_y) ** 2)
+
+            if dist < min_dist:
+                min_dist = dist
+                nearest_node = node_id
+
+        return nearest_node
+
+    def _find_path(self, start_node: str, end_node: str) -> List[str]:
+        """
+        Find a valid path from start_node to end_node using BFS.
+        Uses the EDGES configuration to determine valid connections.
+        Returns list of node IDs representing the path, or empty list if no path exists.
+        """
+        if start_node == end_node:
+            return [start_node]
+
+        if start_node not in NODES or end_node not in NODES:
+            self.log(f"✗ Invalid nodes: {start_node} or {end_node}", "error")
+            return []
+
+        # Build adjacency list from EDGES (bidirectional)
+        adjacency = {node: [] for node in NODES}
+        for edge in EDGES:
+            start = edge.get("start")
+            end = edge.get("end")
+            if start and end:
+                adjacency[start].append(end)
+                adjacency[end].append(start)  # Bidirectional
+
+        # BFS to find shortest path
+        queue = deque([(start_node, [start_node])])
+        visited = {start_node}
+
+        while queue:
+            current, path = queue.popleft()
+
+            for neighbor in adjacency.get(current, []):
+                if neighbor == end_node:
+                    return path + [neighbor]
+
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    queue.append((neighbor, path + [neighbor]))
+
+        self.log(f"✗ No path found from {start_node} to {end_node}", "error")
+        return []
+
+    def send_goto_node(self, target_node: str):
+        """
+        Navigate to a target node using valid edges.
+        Called when user clicks on a node in the GUI.
+        """
+        with self.lock:
+            # Determine starting node
+            start_node = self.last_node_id
+
+            # If we don't have a last_node_id, find nearest node
+            if not start_node:
+                start_node = self._find_nearest_node()
+                if start_node:
+                    self.log(f"📍 Starting from nearest node: {start_node}", "info")
+                    self.last_node_id = start_node
+                else:
+                    self.log("✗ Cannot determine starting position", "error")
+                    return
+
+            # If already at target
+            if start_node == target_node:
+                self.log(f"Already at {target_node}", "info")
+                return
+
+            # Find path using edges
+            path = self._find_path(start_node, target_node)
+
+            if not path:
+                self.log(f"✗ No valid path from {start_node} to {target_node}", "error")
+                return
+
+            self.log(f"📍 Path: {' → '.join(path)}", "info")
+
+            # Use the existing mission sequence logic
+            self.set_mission_sequence(path)
+
+    def send_mission(self, path: List[str]):
+        """
+        Start a mission with the given path.
+        Called by GUI for predefined missions.
+        """
+        if not path:
+            self.log("✗ Empty path provided", "error")
+            return
+
+        # If we don't know current position, find it first
+        if not self.last_node_id:
+            nearest = self._find_nearest_node()
+            if nearest:
+                self.last_node_id = nearest
+                self.log(f"📍 Current position: {nearest}", "info")
+            else:
+                self.log("✗ Cannot determine starting position", "error")
+                return
+
+        # Check if robot is at the start of the mission
+        if self.last_node_id != path[0]:
+            # Robot is not at the start of the mission
+            # Find path from current location to mission start
+            prefix_path = self._find_path(self.last_node_id, path[0])
+            if prefix_path and len(prefix_path) > 1:
+                # Combine: prefix (without last element, since it's path[0]) + mission path
+                full_path = prefix_path[:-1] + path
+                self.log(f"📍 Extended path: {' → '.join(full_path)}", "info")
+                self.set_mission_sequence(full_path)
+            else:
+                # No valid path or already at start, use mission as-is
+                self.set_mission_sequence(path)
+        else:
+            self.set_mission_sequence(path)
 
     # ========================================================================
     # VDA5050 ORDER HANDLING
@@ -362,7 +534,7 @@ class RobotBackend:
         nodes = order.get("nodes", [])
         for node_data in nodes:
             node_actions = node_data.get("actions", [])
-            
+
             ns = NodeState(
                 nodeId=node_data.get("nodeId", ""),
                 sequenceId=node_data.get("sequenceId", 0),
@@ -395,7 +567,7 @@ class RobotBackend:
         self.edge_states = []
         for edge_data in order.get("edges", []):
             edge_actions = edge_data.get("actions", [])
-            
+
             es = EdgeState(
                 edgeId=edge_data.get("edgeId", ""),
                 sequenceId=edge_data.get("sequenceId", 0),
@@ -436,7 +608,7 @@ class RobotBackend:
             self.gui_node_states[first] = "done"
             self.last_node_id = first
             self.traversed_node_indices = 1
-            
+
             # Execute actions for this node
             for ns in self.node_states:
                 if ns.nodeId == first and ns.actions:
@@ -512,7 +684,7 @@ class RobotBackend:
     def _execute_node_actions(self, actions: List[Dict]):
         """
         Execute actions attached to a node.
-        
+
         Blocking Types:
         - NONE: Execute in parallel (don't wait)
         - SOFT: Execute, robot stopped but other actions can run in parallel
@@ -522,7 +694,7 @@ class RobotBackend:
         none_actions = []
         soft_actions = []
         hard_actions = []
-        
+
         for action in actions:
             blocking_type = action.get("blockingType", "HARD")
             if blocking_type == "NONE":
@@ -531,15 +703,15 @@ class RobotBackend:
                 soft_actions.append(action)
             else:  # HARD
                 hard_actions.append(action)
-        
+
         # Execute NONE actions first (fire and forget, parallel with driving)
         for action in none_actions:
             self._execute_single_action(action, wait=False)
-        
+
         # Execute SOFT actions (can run in parallel with each other)
         for action in soft_actions:
             self._execute_single_action(action, wait=False)
-        
+
         # Execute HARD actions sequentially (wait for each)
         for action in hard_actions:
             self._execute_single_action(action, wait=True)
@@ -550,30 +722,30 @@ class RobotBackend:
         action_id = action.get("actionId", "")
         blocking_type = action.get("blockingType", "HARD")
         action_params = action.get("actionParameters", [])
-        
+
         self.log(f"🎬 Action: {action_type} [{blocking_type}]", "info")
-        
+
         # Update action state to RUNNING
         self._update_action_state(action_id, "RUNNING")
-        
+
         # Execute based on action type
         success = False
-        
+
         if action_type == "beep":
             self._send_action_to_bridge(action)
             success = True
-            
+
         elif action_type == "locate":
             self._send_action_to_bridge(action)
             success = True
-            
+
         elif action_type == "setFanSpeed":
             # Extract speed parameter
             speed = "medium"  # default
             for param in action_params:
                 if param.get("key") == "speed":
                     speed = param.get("value", "medium")
-            
+
             # Send setFanSpeed action
             fan_action = {
                 "actionType": "setFanSpeed",
@@ -584,14 +756,14 @@ class RobotBackend:
             self._send_action_to_bridge(fan_action)
             self.log(f"   Fan speed → {speed}", "info")
             success = True
-            
+
         elif action_type == "setVolume":
             # Extract volume parameter
             volume = 50  # default
             for param in action_params:
                 if param.get("key") == "volume":
                     volume = param.get("value", 50)
-            
+
             volume_action = {
                 "actionType": "setVolume",
                 "actionId": action_id,
@@ -601,27 +773,27 @@ class RobotBackend:
             self._send_action_to_bridge(volume_action)
             self.log(f"   Volume → {volume}", "info")
             success = True
-            
+
         elif action_type in ["startCleaning", "stopCleaning", "pauseCleaning"]:
             self._send_action_to_bridge(action)
             success = True
-            
+
         elif action_type in ["dock", "quickCharge"]:
             self._send_action_to_bridge(action)
             success = True
-            
+
         else:
             # Unknown action - forward to bridge anyway
             self.log(f"   ⚠ Unknown action type: {action_type}", "warning")
             self._send_action_to_bridge(action)
             success = True
-        
+
         # Wait for action to complete if blocking
         if wait and success:
             # Simple delay for actions (in real system, wait for confirmation)
             action_delay = self._get_action_delay(action_type)
             time.sleep(action_delay)
-        
+
         # Update action state
         if success:
             self._update_action_state(action_id, "FINISHED")
@@ -675,7 +847,7 @@ class RobotBackend:
         with self.lock:
             if self.paused:
                 return
-                
+
             if not self.mission_queue:
                 has_horizon = any(not ns.released for ns in self.node_states)
                 if has_horizon:
@@ -689,12 +861,12 @@ class RobotBackend:
 
             next_node = self.mission_queue.pop(0)
             self.current_target_node = next_node
-            
+
             # Check if approaching decision point (next node is last in base, horizon exists)
             # newBaseRequest should be TRUE when we're heading to the decision point
             has_horizon = any(not ns.released for ns in self.node_states)
             is_heading_to_decision_point = (len(self.mission_queue) == 0) and has_horizon
-            
+
             if is_heading_to_decision_point:
                 self.new_base_request = True
                 self.log(f"📡 newBaseRequest: true (approaching decision point)", "warning")
@@ -727,7 +899,7 @@ class RobotBackend:
     def _send_goto(self, node_id: str):
         """Send goTo command"""
         target = None
-        
+
         # First try: Get from order's nodePosition
         for ns in self.node_states:
             if ns.nodeId == node_id and ns.nodePosition:
@@ -735,12 +907,12 @@ class RobotBackend:
                 if pos.get("x") is not None and pos.get("y") is not None:
                     target = {"x": pos["x"], "y": pos["y"]}
                     break
-        
+
         # Second try: Get from config NODES
         if not target and node_id in NODES:
             node_config = NODES[node_id]
             target = {"x": node_config["x"], "y": node_config["y"]}
-        
+
         if not target:
             self.log(f"✗ Unknown node: {node_id} (not in order or config)", "error")
             return
@@ -790,6 +962,18 @@ class RobotBackend:
         self.current_target_node = None
         self.waiting_at_decision_point = False
         self.new_base_request = False
+
+        # Clear VDA 5050 state
+        self.node_states = []
+        self.edge_states = []
+        self.action_states = []
+
+        # Clear order info
+        self.current_order = None
+        self.order_id = ""
+        self.order_update_id = 0
+
+        # Reset all node colors to idle
         self._reset_gui_colors()
 
     def _reset_gui_colors(self):
@@ -804,7 +988,7 @@ class RobotBackend:
     def _main_loop(self):
         """Main loop"""
         while self.running:
-            time.sleep(0.2)
+            time.sleep(0.1)  # Reduced from 0.2 for faster arrival detection
 
             self._update_animation()
 
@@ -824,12 +1008,10 @@ class RobotBackend:
             if self.paused or self.waiting_at_decision_point:
                 continue
 
-            if time.time() - self.last_command_ts < COMMAND_COOLDOWN_SEC:
-                continue
-
-            # Check arrival
+            # Check arrival - don't let command cooldown block arrival detection!
             if self._is_at_node(self.current_target_node) and not self.is_driving:
                 self._on_node_reached(self.current_target_node)
+            # Only apply cooldown for stalled retry commands
             elif time.time() - self.last_command_ts > STALLED_TIMEOUT_SEC and not self.is_driving:
                 self.log(f"⚠ Stalled, retrying...", "warning")
                 self._send_navigation_command(self.current_target_node)
@@ -844,6 +1026,21 @@ class RobotBackend:
         for ns in self.node_states:
             if ns.nodeId == node_id:
                 self.last_node_sequence_id = ns.sequenceId
+
+                # ===== FIX: Remove the incoming edge =====
+                # VDA 5050: When node is traversed, remove edge leading TO it
+                # Edge sequenceId = Node sequenceId - 1
+                incoming_edge_seq_id = ns.sequenceId - 1
+                self.edge_states = [
+                    es for es in self.edge_states
+                    if es.sequenceId != incoming_edge_seq_id
+                ]
+                self.log(f"   Removed edge with seqId {incoming_edge_seq_id}")
+
+                # Log node removal as well
+                self.log(f"   Removed node {node_id} with seqId {ns.sequenceId}")
+                # ===== END FIX =====
+
                 break
 
         if node_id in self.gui_node_states:
@@ -860,7 +1057,7 @@ class RobotBackend:
     def _is_at_node(self, node_id: str) -> bool:
         """Check if at node"""
         target = None
-        
+
         # First try: Get from order's nodePosition
         for ns in self.node_states:
             if ns.nodeId == node_id and ns.nodePosition:
@@ -868,7 +1065,7 @@ class RobotBackend:
                 if pos.get("x") is not None and pos.get("y") is not None:
                     target = {"x": pos["x"], "y": pos["y"]}
                     break
-        
+
         # Second try: Get from config NODES
         if not target and node_id in NODES:
             node_config = NODES[node_id]
@@ -893,7 +1090,7 @@ class RobotBackend:
         for action in actions:
             action_type = action.get("actionType", "")
             self.log(f"📥 Instant Action: {action_type}", "info")
-            
+
             if action_type == "stopPause" or action_type == "resumeOrder":
                 self.resume_mission()
             elif action_type == "startPause" or action_type == "pauseOrder":
@@ -935,7 +1132,7 @@ class RobotBackend:
             "serialNumber": SERIAL_NUMBER,
             "orderId": self.order_id,
             "orderUpdateId": self.order_update_id,
-            "lastNodeId": self.last_node_id,
+            "lastNodeId": self.last_node_id or "",  # VDA 5050: empty string if no node traversed
             "lastNodeSequenceId": self.last_node_sequence_id,
             "driving": self.is_driving,
             "paused": self.paused,
@@ -975,7 +1172,7 @@ class RobotBackend:
         """Pause mission - sends pause command to robot"""
         self.paused = True
         self.log("⏸ Mission PAUSED", "warning")
-        
+
         # Send pause command to bridge
         action_msg = {
             "headerId": self._next_header_id(),
@@ -997,7 +1194,7 @@ class RobotBackend:
         if self.mission_queue or self.current_target_node or self.waiting_at_decision_point:
             self.paused = False
             self.log("▶ Mission RESUMED", "success")
-            
+
             # Send resume command to bridge
             action_msg = {
                 "headerId": self._next_header_id(),
@@ -1013,7 +1210,7 @@ class RobotBackend:
                 }]
             }
             self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
-            
+
             # If we have a current target, resend navigation command
             if self.current_target_node and not self.waiting_at_decision_point:
                 self._send_navigation_command(self.current_target_node)
@@ -1021,7 +1218,7 @@ class RobotBackend:
     def emergency_stop(self):
         """Emergency stop - cancels order and stops robot"""
         self.log("🛑 ORDER CANCELLED", "error")
-        
+
         # Send stop command to bridge
         action_msg = {
             "headerId": self._next_header_id(),
@@ -1037,7 +1234,7 @@ class RobotBackend:
             }]
         }
         self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
-        
+
         # Clear order state
         self.mission_active = False
         self.paused = False
@@ -1050,6 +1247,52 @@ class RobotBackend:
         self.edge_states = []
         self.action_states = []
         self._reset_gui_colors()
+
+    def stop_mission(self):
+        """Stop current mission - alias for emergency_stop"""
+        self.emergency_stop()
+
+    def send_instant_action(self, action_type: str):
+        """
+        Send an instant action command.
+        Called by GUI for actions like pause, resume, beep, locate, dock.
+        """
+        # Map GUI action names to actual action types
+        action_map = {
+            "pauseMovement": "startPause",
+            "resumeMovement": "stopPause",
+            "pause": "startPause",
+            "resume": "stopPause",
+            "beep": "beep",
+            "locate": "locate",
+            "dock": "dock"
+        }
+
+        actual_action = action_map.get(action_type, action_type)
+
+        if actual_action == "startPause":
+            self.pause_mission()
+        elif actual_action == "stopPause":
+            self.resume_mission()
+        elif actual_action == "dock":
+            self._send_dock_command()
+        else:
+            # Send action to bridge
+            action_msg = {
+                "headerId": self._next_header_id(),
+                "timestamp": self._get_timestamp(),
+                "version": VDA_VERSION,
+                "manufacturer": MANUFACTURER,
+                "serialNumber": SERIAL_NUMBER,
+                "actions": [{
+                    "actionType": actual_action,
+                    "actionId": f"{actual_action}_{int(time.time() * 1000)}",
+                    "blockingType": "NONE",
+                    "actionParameters": []
+                }]
+            }
+            self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+            self.log(f"📤 Instant action: {actual_action}", "info")
 
     # ========================================================================
     # GUI MISSION SUPPORT
@@ -1094,11 +1337,11 @@ class RobotBackend:
 
             for i in range(len(path) - 1):
                 es = EdgeState(
-                    edgeId=f"e_{path[i]}_{path[i+1]}",
+                    edgeId=f"e_{path[i]}_{path[i + 1]}",
                     sequenceId=i * 2 + 1,
                     released=True,
                     startNodeId=path[i],
-                    endNodeId=path[i+1]
+                    endNodeId=path[i + 1]
                 )
                 self.edge_states.append(es)
 
@@ -1121,6 +1364,151 @@ class RobotBackend:
 
             self._advance_mission()
 
+    def set_mission_with_horizon(self, path: List[str], base_count: int):
+        """
+        Set mission with base/horizon split.
+
+        Args:
+            path: Full path of node IDs
+            base_count: Number of nodes to release (base), rest stay in horizon
+        """
+        with self.lock:
+            if not path or len(path) < 2:
+                self.log("✗ Invalid path", "error")
+                return
+
+            if self.mission_active:
+                self.log("⏹ Cancelling current mission", "warning")
+                self.mission_active = False
+                self.mission_queue = []
+                self.current_target_node = None
+
+            # Clamp base_count
+            base_count = max(1, min(base_count, len(path)))
+            horizon_count = len(path) - base_count
+
+            if horizon_count > 0:
+                self.log(f"🎯 Mission with Horizon:", "info")
+                self.log(f"   Base ({base_count}): {' → '.join(path[:base_count])}", "info")
+                self.log(f"   Horizon ({horizon_count}): {' → '.join(path[base_count:])}", "warning")
+                order_name = "GUI_Horizon_Order"
+            else:
+                self.log(f"🎯 GUI Mission: {' → '.join(path)}", "info")
+                order_name = "GUI_Order"
+
+            self._reset_gui_colors()
+
+            # Use simple readable order ID for GUI missions
+            self.order_id = order_name
+            self.order_update_id = 0
+            self.current_order = {"orderId": self.order_id, "orderUpdateId": 0}
+
+            self.node_states = []
+            self.edge_states = []
+            self.action_states = []
+            self.traversed_node_indices = 0
+
+            # Create node states with released flag based on base_count
+            for i, node_id in enumerate(path):
+                if node_id in NODES:
+                    is_released = (i < base_count)
+                    ns = NodeState(
+                        nodeId=node_id,
+                        sequenceId=i * 2,
+                        released=is_released,
+                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "mapId": MAP_ID}
+                    )
+                    self.node_states.append(ns)
+
+            # Create edge states - edge is released if BOTH its nodes are released
+            for i in range(len(path) - 1):
+                is_released = (i < base_count - 1)  # Edge i connects node i to node i+1
+                es = EdgeState(
+                    edgeId=f"e_{path[i]}_{path[i + 1]}",
+                    sequenceId=i * 2 + 1,
+                    released=is_released,
+                    startNodeId=path[i],
+                    endNodeId=path[i + 1]
+                )
+                self.edge_states.append(es)
+
+            # Only queue the BASE nodes for navigation (not horizon)
+            base_path = path[:base_count]
+
+            if base_path[0] == self.last_node_id:
+                base_path = base_path[1:]
+                self.traversed_node_indices = 1
+
+            if not base_path:
+                if horizon_count > 0:
+                    self.log("⏸ At decision point - waiting for horizon release", "warning")
+                    self.waiting_at_decision_point = True
+                    self.new_base_request = True
+                else:
+                    self.log("Already at destination", "info")
+                return
+
+            self.mission_queue = base_path.copy()
+
+            # Color nodes appropriately
+            for node_id in path[:base_count]:
+                if node_id in self.gui_node_states:
+                    self.gui_node_states[node_id] = "planned"
+
+            self.mission_active = True
+            self.paused = False
+            self.waiting_at_decision_point = False
+
+            self._advance_mission()
+
+    def release_horizon_node(self, node_id: str = None):
+        """
+        Release the next horizon node(s) to base.
+
+        If node_id is specified, releases up to and including that node.
+        If node_id is None, releases just the next horizon node.
+        """
+        with self.lock:
+            if not self.node_states:
+                self.log("No active order", "warning")
+                return
+
+            # Find horizon nodes
+            horizon_nodes = [(i, ns) for i, ns in enumerate(self.node_states) if not ns.released]
+
+            if not horizon_nodes:
+                self.log("No horizon nodes to release", "info")
+                return
+
+            # Release the first horizon node
+            idx, first_horizon = horizon_nodes[0]
+            first_horizon.released = True
+            self.log(f"✓ Released: {first_horizon.nodeId}", "success")
+
+            # Also release the edge leading to this node
+            for es in self.edge_states:
+                if es.endNodeId == first_horizon.nodeId and not es.released:
+                    es.released = True
+                    self.log(f"   Released edge: {es.edgeId}", "info")
+                    break
+
+            # Increment order update ID (VDA 5050 requirement)
+            self.order_update_id += 1
+            if self.current_order:
+                self.current_order["orderUpdateId"] = self.order_update_id
+
+            # Add released node to mission queue
+            self.mission_queue.append(first_horizon.nodeId)
+            if first_horizon.nodeId in self.gui_node_states:
+                self.gui_node_states[first_horizon.nodeId] = "planned"
+
+            # If we were waiting at decision point, continue
+            if self.waiting_at_decision_point:
+                self.waiting_at_decision_point = False
+                self.new_base_request = False
+                self.log("▶ Continuing mission after horizon release", "success")
+                self._advance_mission()
+
     # ========================================================================
     # UTILITY
     # ========================================================================
@@ -1136,11 +1524,11 @@ class RobotBackend:
     # ERROR MANAGEMENT
     # ========================================================================
 
-    def add_error(self, error_type: str, error_level: str = "WARNING", 
+    def add_error(self, error_type: str, error_level: str = "WARNING",
                   error_description: str = "", error_references: List[Dict] = None):
         """
         Add an error to the error list.
-        
+
         Args:
             error_type: Type of error (e.g., "orderError", "navigationError")
             error_level: "WARNING" (self-resolving) or "FATAL" (needs intervention)
@@ -1176,17 +1564,26 @@ class RobotBackend:
             "waiting_at_decision_point": self.waiting_at_decision_point,
         }
 
+    @property
+    def current_order_id(self):
+        """Alias for order_id for GUI compatibility"""
+        return self.order_id
+
     def stop(self):
         """Stop backend gracefully"""
         self.running = False
         self.mission_active = False
-        
+
         # Publish OFFLINE before disconnecting
         if self.client and self._connected:
             self._publish_connection_state("OFFLINE", log=True)
             time.sleep(0.2)  # Allow message to be sent
-            
+
         if self.client:
             self.client.loop_stop()
             self.client.disconnect()
         self.log("✓ Backend stopped", "info")
+
+
+# Alias for backward compatibility with GUI
+VDA5050Backend = RobotBackend

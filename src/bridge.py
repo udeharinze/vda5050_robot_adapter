@@ -18,7 +18,7 @@ except ImportError:
 ROBOT_IP = "192.168.178.69"  # UPDATE with your robot's IP
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
-STATE_INTERVAL = 1
+STATE_INTERVAL = 5
 
 print(f"Bridge is configured for Robot IP: {ROBOT_IP}")
 
@@ -64,13 +64,16 @@ def get_robot_data():
 
         # Parse attributes - handle both __class and __class__ formats
         for attribute in state_data.get('attributes', []):
+            # Get the class name - try both formats
             attr_class = attribute.get('__class') or attribute.get('__class__') or ""
 
             if 'BatteryStateAttribute' in attr_class:
                 battery_level = attribute.get('level', 0)
                 battery_flag = attribute.get('flag', 'unknown')
+                # print(f"DEBUG: Found battery: {battery_level}%, flag: {battery_flag}")
             elif 'StatusStateAttribute' in attr_class:
                 status_value = attribute.get('value', 'unknown')
+                # print(f"DEBUG: Found status: {status_value}")
 
         # --- Derive VDA 5050 Fields ---
         is_driving = status_value in ['cleaning', 'returning', 'moving', 'manual_control', 'going_to_target']
@@ -154,7 +157,7 @@ def loop_state_and_visualization(mqtt_client):
                 debug_printed = True
                 print("--- Debug messages above will stop after first successful parse ---")
 
-            print(f"STATE: Pos({data['x']}, {data['y']}) | Theta {data['theta_deg']}deg | {theta_vda}rad | "
+            print(f"STATE: Pos({data['x']}, {data['y']}) | Theta {data['theta_deg']}° |  {theta_vda} | "
                   f"Batt {data['battery']}% | Charging: {data['charging']} | Status: {data['status']}")
 
         time.sleep(STATE_INTERVAL)
@@ -199,10 +202,13 @@ def on_message(client, userdata, msg):
             elif action_type == 'goTo':
                 actions_navigation.handle_goto(ROBOT_IP, vda_action.get('actionParameters', []))
             elif action_type == 'stopMovement':
+                # Stop the robot using Valetudo API
                 handle_stop(ROBOT_IP)
             elif action_type == 'pauseMovement':
+                # Pause the robot using Valetudo API
                 handle_pause(ROBOT_IP)
             elif action_type == 'resumeMovement':
+                # Resume the robot using Valetudo API
                 handle_resume(ROBOT_IP)
             else:
                 print(f"Unknown VDA action type: {action_type}")
