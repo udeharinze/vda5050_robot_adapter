@@ -40,16 +40,16 @@ VDA 5050 is a standardized interface for communication between Automated Guided 
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                       BRIDGE                                │
-│                   (bridge.py)                           │
+│                   (bridge.py)                               │
 │  • Translates VDA 5050 → Valetudo HTTP API                  │
-│  • Polls robot position (e.g 2s interval)                     │
+│  • Polls robot position (e.g 2s interval)                   │
 │  • Executes navigation commands                             │
 └─────────────────────────┬───────────────────────────────────┘
                           │ HTTP REST API
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    DREAME ROBOT                             │
-│              (Valetudo Firmware @ 192.168.x.x)              │
+│  (Valetudo Firmware @ 192.168.x.x)                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
