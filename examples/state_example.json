@@ -1,0 +1,71 @@
+{
+  "headerId": 42,
+  "timestamp": "2025-01-01T12:00:05.000Z",
+  "version": "2.1.0",
+  "manufacturer": "Dreame",
+  "serialNumber": "robot001",
+  "orderId": "order_001",
+  "orderUpdateId": 0,
+  "lastNodeId": "node1",
+  "lastNodeSequenceId": 2,
+  "driving": true,
+  "paused": false,
+  "newBaseRequest": false,
+  "distanceSinceLastNode": 150.5,
+  "nodeStates": [
+    {
+      "nodeId": "node2",
+      "sequenceId": 4,
+      "nodeDescription": "",
+      "released": true,
+      "nodePosition": {
+        "x": 3252,
+        "y": 2918,
+        "mapId": "lab"
+      }
+    }
+  ],
+  "edgeStates": [
+    {
+      "edgeId": "e_node1_node2",
+      "sequenceId": 3,
+      "edgeDescription": "",
+      "released": true,
+      "trajectory": null
+    }
+  ],
+  "agvPosition": {
+    "x": 3240,
+    "y": 3050,
+    "theta": 1.57,
+    "mapId": "lab",
+    "positionInitialized": true,
+    "localizationScore": 1.0
+  },
+  "velocity": {
+    "vx": 0.3,
+    "vy": 0.0,
+    "omega": 0.0
+  },
+  "batteryState": {
+    "batteryCharge": 85.0,
+    "batteryVoltage": 14.4,
+    "charging": false,
+    "reach": 3600
+  },
+  "operatingMode": "AUTOMATIC",
+  "safetyState": {
+    "eStop": "NONE",
+    "fieldViolation": false
+  },
+  "actionStates": [
+    {
+      "actionId": "beep_001",
+      "actionStatus": "FINISHED",
+      "actionType": "beep",
+      "resultDescription": "Beep completed"
+    }
+  ],
+  "errors": [],
+  "informations": []
+}

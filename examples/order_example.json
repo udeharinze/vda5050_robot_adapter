@@ -1,0 +1,69 @@
+{
+  "headerId": 1,
+  "timestamp": "2025-01-01T12:00:00.000Z",
+  "version": "2.1.0",
+  "manufacturer": "Dreame",
+  "serialNumber": "robot001",
+  "orderId": "order_001",
+  "orderUpdateId": 0,
+  "nodes": [
+    {
+      "nodeId": "home",
+      "sequenceId": 0,
+      "released": true,
+      "nodePosition": {
+        "x": 3269,
+        "y": 3352,
+        "mapId": "lab"
+      },
+      "actions": []
+    },
+    {
+      "nodeId": "node1",
+      "sequenceId": 2,
+      "released": true,
+      "nodePosition": {
+        "x": 3228,
+        "y": 3143,
+        "mapId": "lab"
+      },
+      "actions": [
+        {
+          "actionId": "beep_001",
+          "actionType": "beep",
+          "blockingType": "NONE",
+          "actionParameters": []
+        }
+      ]
+    },
+    {
+      "nodeId": "node2",
+      "sequenceId": 4,
+      "released": true,
+      "nodePosition": {
+        "x": 3252,
+        "y": 2918,
+        "mapId": "lab"
+      },
+      "actions": []
+    }
+  ],
+  "edges": [
+    {
+      "edgeId": "e_home_node1",
+      "sequenceId": 1,
+      "startNodeId": "home",
+      "endNodeId": "node1",
+      "released": true,
+      "actions": []
+    },
+    {
+      "edgeId": "e_node1_node2",
+      "sequenceId": 3,
+      "startNodeId": "node1",
+      "endNodeId": "node2",
+      "released": true,
+      "actions": []
+    }
+  ]
+}

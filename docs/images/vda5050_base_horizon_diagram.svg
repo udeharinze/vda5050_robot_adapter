@@ -1,0 +1,181 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 500">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#2C3E50"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#27AE60"/>
+    </marker>
+  </defs>
+  
+  <!-- Background -->
+  <rect width="900" height="500" fill="#F8F9FA"/>
+  
+  <!-- Title -->
+  <text x="450" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="22" font-weight="bold" fill="#1E3A5F">Base &amp; Horizon Mechanism (Traffic Control)</text>
+  
+  <!-- SECTION 1: Initial Order -->
+  <text x="50" y="75" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1E3A5F">1. Initial Order with Base + Horizon</text>
+  
+  <!-- Nodes - Initial Order -->
+  <g transform="translate(50, 100)">
+    <!-- Home node (BASE) -->
+    <circle cx="60" cy="40" r="30" fill="#27AE60" stroke="#1E8449" stroke-width="3"/>
+    <text x="60" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">home</text>
+    <text x="60" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#27AE60">BASE</text>
+    
+    <!-- Edge 1 -->
+    <line x1="95" y1="40" x2="145" y2="40" stroke="#2C3E50" stroke-width="3" marker-end="url(#arrow)"/>
+    
+    <!-- Node1 (BASE) -->
+    <circle cx="180" cy="40" r="30" fill="#27AE60" stroke="#1E8449" stroke-width="3"/>
+    <text x="180" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">node1</text>
+    <text x="180" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#27AE60">BASE</text>
+    
+    <!-- Edge 2 -->
+    <line x1="215" y1="40" x2="265" y2="40" stroke="#2C3E50" stroke-width="3" marker-end="url(#arrow)"/>
+    
+    <!-- Node2 (DECISION POINT) -->
+    <circle cx="300" cy="40" r="30" fill="#E74C3C" stroke="#C0392B" stroke-width="3"/>
+    <text x="300" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">node2</text>
+    <text x="300" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#E74C3C">DECISION</text>
+    <text x="300" y="98" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#E74C3C">POINT</text>
+    
+    <!-- Edge 3 (dotted - horizon) -->
+    <line x1="335" y1="40" x2="385" y2="40" stroke="#95A5A6" stroke-width="3" stroke-dasharray="8,4"/>
+    
+    <!-- Node3 (HORIZON) -->
+    <circle cx="420" cy="40" r="30" fill="white" stroke="#95A5A6" stroke-width="3" stroke-dasharray="8,4"/>
+    <text x="420" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#95A5A6">node3</text>
+    <text x="420" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#95A5A6">HORIZON</text>
+    
+    <!-- Edge 4 (dotted - horizon) -->
+    <line x1="455" y1="40" x2="505" y2="40" stroke="#95A5A6" stroke-width="3" stroke-dasharray="8,4"/>
+    
+    <!-- Node4 (HORIZON) -->
+    <circle cx="540" cy="40" r="30" fill="white" stroke="#95A5A6" stroke-width="3" stroke-dasharray="8,4"/>
+    <text x="540" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#95A5A6">node4</text>
+    <text x="540" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#95A5A6">HORIZON</text>
+    
+    <!-- Robot icon at home -->
+    <g transform="translate(60, 40)">
+      <circle cx="0" cy="0" r="15" fill="#3498DB"/>
+      <text x="0" y="5" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white">🤖</text>
+    </g>
+  </g>
+  
+  <!-- Legend box -->
+  <g transform="translate(650, 95)">
+    <rect x="0" y="0" width="200" height="90" rx="8" fill="white" stroke="#BDC3C7"/>
+    <text x="100" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="#1E3A5F">Legend</text>
+    
+    <circle cx="25" cy="40" r="10" fill="#27AE60"/>
+    <text x="45" y="45" font-family="Arial, sans-serif" font-size="10" fill="#2C3E50">BASE (released: true)</text>
+    
+    <circle cx="25" cy="65" r="10" fill="white" stroke="#95A5A6" stroke-width="2" stroke-dasharray="4,2"/>
+    <text x="45" y="70" font-family="Arial, sans-serif" font-size="10" fill="#2C3E50">HORIZON (released: false)</text>
+  </g>
+  
+  <!-- SECTION 2: Robot at Decision Point -->
+  <text x="50" y="230" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1E3A5F">2. Robot Reaches Decision Point → STOPS &amp; Waits</text>
+  
+  <g transform="translate(50, 255)">
+    <!-- Home node (passed) -->
+    <circle cx="60" cy="40" r="30" fill="#BDC3C7" stroke="#95A5A6" stroke-width="3"/>
+    <text x="60" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#7F8C8D">home</text>
+    <text x="60" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#95A5A6">✓ passed</text>
+    
+    <!-- Edge 1 (passed) -->
+    <line x1="95" y1="40" x2="145" y2="40" stroke="#BDC3C7" stroke-width="3"/>
+    
+    <!-- Node1 (passed) -->
+    <circle cx="180" cy="40" r="30" fill="#BDC3C7" stroke="#95A5A6" stroke-width="3"/>
+    <text x="180" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#7F8C8D">node1</text>
+    <text x="180" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#95A5A6">✓ passed</text>
+    
+    <!-- Edge 2 (passed) -->
+    <line x1="215" y1="40" x2="265" y2="40" stroke="#BDC3C7" stroke-width="3"/>
+    
+    <!-- Node2 (ROBOT HERE - STOPPED) -->
+    <circle cx="300" cy="40" r="30" fill="#E74C3C" stroke="#C0392B" stroke-width="4"/>
+    <text x="300" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">node2</text>
+    
+    <!-- Robot icon at node2 -->
+    <g transform="translate(300, 40)">
+      <circle cx="0" cy="0" r="18" fill="#3498DB" stroke="#2980B9" stroke-width="3"/>
+      <text x="0" y="5" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="white">🤖</text>
+    </g>
+    
+    <!-- STOP sign -->
+    <text x="300" y="90" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="#E74C3C">⏹ STOPPED</text>
+    
+    <!-- Edge 3 (blocked) -->
+    <line x1="335" y1="40" x2="385" y2="40" stroke="#E74C3C" stroke-width="3" stroke-dasharray="8,4"/>
+    <text x="360" y="25" text-anchor="middle" font-family="Arial, sans-serif" font-size="20" fill="#E74C3C">✗</text>
+    
+    <!-- Node3 (HORIZON - waiting) -->
+    <circle cx="420" cy="40" r="30" fill="white" stroke="#F39C12" stroke-width="3" stroke-dasharray="8,4"/>
+    <text x="420" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#F39C12">node3</text>
+    <text x="420" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#F39C12">waiting...</text>
+    
+    <!-- Edge 4 -->
+    <line x1="455" y1="40" x2="505" y2="40" stroke="#95A5A6" stroke-width="3" stroke-dasharray="8,4"/>
+    
+    <!-- Node4 (HORIZON) -->
+    <circle cx="540" cy="40" r="30" fill="white" stroke="#95A5A6" stroke-width="3" stroke-dasharray="8,4"/>
+    <text x="540" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="#95A5A6">node4</text>
+  </g>
+  
+  <!-- State message box -->
+  <g transform="translate(650, 250)">
+    <rect x="0" y="0" width="200" height="70" rx="8" fill="#FEF9E7" stroke="#F39C12"/>
+    <text x="100" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="#9A7D0A">State Message</text>
+    <text x="15" y="40" font-family="Consolas, monospace" font-size="9" fill="#2C3E50">newBaseRequest: true</text>
+    <text x="15" y="55" font-family="Consolas, monospace" font-size="9" fill="#2C3E50">driving: false</text>
+  </g>
+  
+  <!-- SECTION 3: After Order Update -->
+  <text x="50" y="385" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1E3A5F">3. Master Sends Order Update → Robot Continues</text>
+  
+  <g transform="translate(50, 410)">
+    <!-- Node2 (stitch point) -->
+    <circle cx="300" cy="40" r="30" fill="#27AE60" stroke="#1E8449" stroke-width="3"/>
+    <text x="300" y="35" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="white">node2</text>
+    <text x="300" y="50" text-anchor="middle" font-family="Arial, sans-serif" font-size="9" fill="white">(stitch)</text>
+    
+    <!-- Robot moving -->
+    <g transform="translate(340, 40)">
+      <circle cx="0" cy="0" r="15" fill="#3498DB"/>
+      <text x="0" y="5" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="white">🤖</text>
+      <!-- Motion lines -->
+      <line x1="-25" y1="0" x2="-35" y2="0" stroke="#3498DB" stroke-width="2"/>
+      <line x1="-25" y1="-5" x2="-32" y2="-5" stroke="#3498DB" stroke-width="1"/>
+      <line x1="-25" y1="5" x2="-32" y2="5" stroke="#3498DB" stroke-width="1"/>
+    </g>
+    
+    <!-- Edge 3 (NOW RELEASED) -->
+    <line x1="335" y1="40" x2="385" y2="40" stroke="#27AE60" stroke-width="3" marker-end="url(#arrow-green)"/>
+    
+    <!-- Node3 (NOW RELEASED) -->
+    <circle cx="420" cy="40" r="30" fill="#27AE60" stroke="#1E8449" stroke-width="3"/>
+    <text x="420" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">node3</text>
+    <text x="420" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#27AE60">RELEASED!</text>
+    
+    <!-- Edge 4 (NOW RELEASED) -->
+    <line x1="455" y1="40" x2="505" y2="40" stroke="#27AE60" stroke-width="3" marker-end="url(#arrow-green)"/>
+    
+    <!-- Node4 (NOW RELEASED) -->
+    <circle cx="540" cy="40" r="30" fill="#27AE60" stroke="#1E8449" stroke-width="3"/>
+    <text x="540" y="45" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">node4</text>
+    <text x="540" y="85" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#27AE60">RELEASED!</text>
+  </g>
+  
+  <!-- Order Update box -->
+  <g transform="translate(650, 405)">
+    <rect x="0" y="0" width="200" height="70" rx="8" fill="#E8F8F5" stroke="#1ABC9C"/>
+    <text x="100" y="20" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" font-weight="bold" fill="#148F77">Order Update</text>
+    <text x="15" y="40" font-family="Consolas, monospace" font-size="9" fill="#2C3E50">orderUpdateId: 1</text>
+    <text x="15" y="55" font-family="Consolas, monospace" font-size="9" fill="#2C3E50">released: true (all)</text>
+  </g>
+  
+</svg>
