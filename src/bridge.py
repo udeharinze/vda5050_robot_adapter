@@ -14,10 +14,19 @@ except ImportError:
     print("Please make sure all .py files are in the same folder.")
     exit()
 
+# --- IMPORT FROM CENTRAL CONFIG ---
+from vda_config import (
+    MQTT_BROKER, MQTT_PORT,
+    MQTT_USERNAME, MQTT_PASSWORD, MQTT_WEBSOCKET, MQTT_WS_PATH, MQTT_VERSION,
+    MANUFACTURER, SERIAL_NUMBER
+)
+
+# --- VDA 5050 TOPICS ---
+TOPIC_VISUALIZATION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/visualization"
+TOPIC_INSTANT_ACTIONS = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/instantActions"
+
 # --- CONFIGURATION ---
 ROBOT_IP = "192.168.178.69"  # UPDATE with your robot's IP
-MQTT_BROKER = "localhost"
-MQTT_PORT = 1883
 STATE_INTERVAL = 5
 
 print(f"Bridge is configured for Robot IP: {ROBOT_IP}")
@@ -125,32 +134,23 @@ def loop_state_and_visualization(mqtt_client):
             }
             velocity = {"vx": 0.0, "vy": 0.0, "omega": 0.0}
 
-            # Send visualization to VDA topic
+            # Send visualization to VDA 5050 topic (backend subscribes to this for position)
             vda_vis = {
                 "headerId": header_id_counter,
                 "timestamp": timestamp,
                 "version": "2.1.0",
-                "manufacturer": "Dreame",
-                "serialNumber": "robot001",
+                "manufacturer": MANUFACTURER,
+                "serialNumber": SERIAL_NUMBER,
                 "agvPosition": agv_position,
-                "velocity": velocity
-            }
-            mqtt_client.publish("uagv/v2/Dreame/robot001/visualization", json.dumps(vda_vis))
-
-            # Send state to bridge topic (for backend to consume)
-            bridge_state = {
-                "agvPosition": {
-                    "x": data["x"],
-                    "y": data["y"],
-                    "theta": theta_vda
-                },
+                "velocity": velocity,
+                # Include extra fields for backend to use
                 "driving": data["driving"],
                 "batteryState": {
                     "batteryCharge": float(data["battery"]),
                     "charging": data["charging"]
                 }
             }
-            mqtt_client.publish("vda5050/robot/state", json.dumps(bridge_state))
+            mqtt_client.publish(TOPIC_VISUALIZATION, json.dumps(vda_vis))
 
             # Print state (only show debug once)
             if not debug_printed:
@@ -164,18 +164,44 @@ def loop_state_and_visualization(mqtt_client):
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
+    global BRIDGE_START_TIME
     if reason_code.is_failure:
         print(f"Failed to connect: {reason_code}. Retrying...")
     else:
-        print(f"Connected to MQTT broker at {MQTT_BROKER}!")
-        client.subscribe("vda5050/robot/instantAction")
-        print("Subscribed to vda5050/robot/instantAction")
+        print(f"✓ Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
+
+        # Set start time BEFORE subscribing (to filter retained messages)
+        from datetime import datetime, timezone
+        BRIDGE_START_TIME = datetime.now(timezone.utc)
+        print(f"⏰ Bridge start time: {BRIDGE_START_TIME.isoformat()}")
+
+        client.subscribe(TOPIC_INSTANT_ACTIONS)
+        print(f"✓ Subscribed to {TOPIC_INSTANT_ACTIONS}")
+
+
+# Track when bridge started (to ignore old retained messages)
+BRIDGE_START_TIME = None
 
 
 def on_message(client, userdata, msg):
+    global BRIDGE_START_TIME
+
     try:
         payload = msg.payload.decode()
         vda_message = json.loads(payload)
+
+        # Check message timestamp - ignore old/retained messages
+        msg_timestamp = vda_message.get('timestamp', '')
+        if msg_timestamp and BRIDGE_START_TIME:
+            try:
+                from datetime import datetime
+                # Parse ISO timestamp
+                msg_time = datetime.fromisoformat(msg_timestamp.replace('Z', '+00:00'))
+                if msg_time < BRIDGE_START_TIME:
+                    print(f"⏭ Ignoring old message (timestamp: {msg_timestamp})")
+                    return
+            except:
+                pass  # If parsing fails, process anyway
 
         for vda_action in vda_message.get('actions', []):
             action_type = vda_action.get('actionType')
@@ -260,12 +286,59 @@ def handle_resume(robot_ip):
 
 # --- MAIN ---
 print("=== VDA 5050 Bridge Starting ===")
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, "Bridge_V1")
+
+# Determine MQTT protocol version
+if MQTT_VERSION == "3.1":
+    protocol = mqtt.MQTTv31
+    print("📋 Using MQTT protocol v3.1")
+elif MQTT_VERSION == "3.1.1":
+    protocol = mqtt.MQTTv311
+    print("📋 Using MQTT protocol v3.1.1")
+else:
+    protocol = mqtt.MQTTv5
+    print("📋 Using MQTT protocol v5.0")
+
+# Create MQTT client - use WebSocket transport if configured
+if MQTT_WEBSOCKET:
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        "Bridge_V1",
+        transport="websockets",
+        protocol=protocol
+    )
+    print("🌐 Using WebSocket transport")
+else:
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        "Bridge_V1",
+        protocol=protocol
+    )
+
 client.on_connect = on_connect
 client.on_message = on_message
 
 try:
-    print(f"Connecting to MQTT broker at {MQTT_BROKER}...")
+    # Set authentication if configured
+    if MQTT_USERNAME and MQTT_PASSWORD:
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        print(f"🔐 MQTT auth enabled for user: {MQTT_USERNAME}")
+
+    # Set TLS/SSL encryption if using WebSocket
+    if MQTT_WEBSOCKET:
+        import ssl
+
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        client.tls_set_context(ssl_context)
+        print("🔒 TLS encryption enabled")
+
+    # Set WebSocket path if configured
+    if MQTT_WEBSOCKET and MQTT_WS_PATH:
+        client.ws_set_options(path=MQTT_WS_PATH)
+        print(f"🌐 WebSocket path: {MQTT_WS_PATH}")
+
+    print(f"📡 Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
     client.connect(MQTT_BROKER, MQTT_PORT, 60)
 
     state_thread = threading.Thread(target=loop_state_and_visualization, args=(client,), daemon=True)

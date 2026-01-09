@@ -21,8 +21,22 @@ DB_PATH = "vda5050.db"
 # MQTT CONFIGURATION
 # ============================================================================
 
-MQTT_BROKER = "localhost"
-MQTT_PORT = 1883
+
+# ============================================================================
+#
+MQTT_BROKER = "#"          #change to your mqtt broker
+MQTT_PORT = "#"            #chnage to your mqtt port for e.g 1883
+MQTT_USERNAME = "#"        #set to None if no websocket
+MQTT_PASSWORD = "#"        #set to None if no websocket/password needed
+MQTT_WEBSOCKET = True      #change to false if not using a websocket
+MQTT_WS_PATH = '#'         #set to None if no websocket
+MQTT_VERSION = "3.1"  # ← MQTT protocol version: "3.1", "3.1.1", or "5.0"
+
+
+
+
+# ============================================================================
+
 
 # ============================================================================
 # NAVIGATION CONSTANTS
@@ -31,13 +45,14 @@ MQTT_PORT = 1883
 @dataclass(frozen=True)
 class NavigationConstants:
     """Navigation tuning constants"""
-    POSITION_TOLERANCE_MM: int = 75      # When to detect arrival
-    AT_NODE_THRESHOLD_MM: int = 50       # When robot is precisely at node
-    PRECHECK_DISTANCE_MM: int = 150      # When to send next goTo (seamless navigation)
+    POSITION_TOLERANCE_MM: int = 75  # When to detect arrival
+    AT_NODE_THRESHOLD_MM: int = 50  # When robot is precisely at node
+    PRECHECK_DISTANCE_MM: int = 150  # When to send next goTo (seamless navigation)
     CLICK_TOLERANCE_PX: int = 15
     COMMAND_COOLDOWN_SEC: float = 2.0
     STALL_TIMEOUT_SEC: float = 15.0
     ANIMATION_DURATION_SEC: float = 0.5
+
 
 NAV = NavigationConstants()
 
@@ -48,6 +63,7 @@ NAV = NavigationConstants()
 FLIP_X = False
 FLIP_Y = True
 SWAP_XY = False
+
 
 # ============================================================================
 # COLORS
@@ -75,6 +91,7 @@ class Colors:
     ROBOT_BODY = "#00BCD4"
     ROBOT_DOT = "#FFFFFF"
 
+
 # Aliases for compatibility
 COLOR_BG = Colors.BG
 COLOR_PANEL = Colors.PANEL
@@ -91,6 +108,7 @@ COLOR_EDGE_DONE = Colors.EDGE_DONE
 COLOR_ROBOT_BODY = Colors.ROBOT_BODY
 COLOR_ROBOT_DOT = Colors.ROBOT_DOT
 
+
 # ============================================================================
 # DATABASE LOADING FUNCTIONS
 # ============================================================================
@@ -100,24 +118,24 @@ def load_from_database():
     if not os.path.exists(DB_PATH):
         print(f"⚠ Database not found: {DB_PATH}, using hardcoded config")
         return None, None, None, None, None
-    
+
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
+
         # Load map info
         cursor.execute("SELECT map_id, name, description FROM maps LIMIT 1")
         map_row = cursor.fetchone()
         map_id = map_row[0] if map_row else "lab"
         map_name = map_row[1] if map_row else "Laboratory"
-        
+
         # Load robot info
         cursor.execute("SELECT serial_number, manufacturer, name FROM robots LIMIT 1")
         robot_row = cursor.fetchone()
         serial_number = robot_row[0] if robot_row else "robot001"
         manufacturer = robot_row[1] if robot_row else "Dreame"
         robot_name = robot_row[2] if robot_row else "Robot"
-        
+
         # Load nodes
         nodes = {}
         cursor.execute("SELECT node_id, x, y, name, node_type FROM nodes WHERE map_id = ?", (map_id,))
@@ -129,7 +147,7 @@ def load_from_database():
                 "name": row[3],
                 "type": row[4]
             }
-        
+
         # Load edges
         edges = []
         cursor.execute("SELECT edge_id, start_node_id, end_node_id FROM edges WHERE map_id = ?", (map_id,))
@@ -139,15 +157,16 @@ def load_from_database():
                 "start": row[1],
                 "end": row[2]
             })
-        
+
         conn.close()
-        
+
         print(f"✓ Loaded from database: {map_name} ({len(nodes)} nodes, {len(edges)} edges)")
         return map_id, manufacturer, serial_number, nodes, edges
-        
+
     except Exception as e:
         print(f"✗ Database error: {e}, using hardcoded config")
         return None, None, None, None, None
+
 
 # ============================================================================
 # LOAD CONFIGURATION
@@ -179,7 +198,7 @@ if _db_nodes:
     NODES = _db_nodes
 else:
     NODES = {
-        "home":  {"x": 3269, "y": 3352, "id": "home"},
+        "home": {"x": 3259, "y": 3353, "id": "home"},
         "node1": {"x": 3228, "y": 3143, "id": "n1"},
         "node2": {"x": 3252, "y": 2918, "id": "n2"},
         "node3": {"x": 3093, "y": 2932, "id": "n3"},
@@ -195,10 +214,10 @@ if _db_edges:
     EDGES = _db_edges
 else:
     EDGES = [
-        {"start": "home",  "end": "node1", "id": "e_home_node1"},
-        {"start": "node1", "end": "home",  "id": "e_node1_home"},
-        {"start": "home",  "end": "node5", "id": "e_home_node5"},
-        {"start": "node5", "end": "home",  "id": "e_node5_home"},
+        {"start": "home", "end": "node1", "id": "e_home_node1"},
+        {"start": "node1", "end": "home", "id": "e_node1_home"},
+        {"start": "home", "end": "node5", "id": "e_home_node5"},
+        {"start": "node5", "end": "home", "id": "e_node5_home"},
         {"start": "node1", "end": "node2", "id": "e_node1_node2"},
         {"start": "node2", "end": "node1", "id": "e_node2_node1"},
         {"start": "node1", "end": "node4", "id": "e_node1_node4"},
@@ -222,6 +241,7 @@ MISSIONS = {
     "Test 2 Nodes": ["home", "node1", "home"],
 }
 
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
@@ -231,36 +251,37 @@ def update_map_id(new_map_id: str):
     if not os.path.exists(DB_PATH):
         print(f"Database not found: {DB_PATH}")
         return False
-    
+
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
+
         # Get current map_id
         cursor.execute("SELECT map_id FROM maps LIMIT 1")
         old_map_id = cursor.fetchone()[0]
-        
+
         # Update all tables
         cursor.execute("UPDATE maps SET map_id = ? WHERE map_id = ?", (new_map_id, old_map_id))
         cursor.execute("UPDATE nodes SET map_id = ? WHERE map_id = ?", (new_map_id, old_map_id))
         cursor.execute("UPDATE edges SET map_id = ? WHERE map_id = ?", (new_map_id, old_map_id))
-        
+
         conn.commit()
         conn.close()
-        
+
         print(f"✓ Updated map_id: {old_map_id} → {new_map_id}")
         return True
-        
+
     except Exception as e:
         print(f"✗ Error updating map_id: {e}")
         return False
+
 
 def update_map_name(new_name: str):
     """Update map name in database"""
     if not os.path.exists(DB_PATH):
         print(f"Database not found: {DB_PATH}")
         return False
-    
+
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -273,20 +294,36 @@ def update_map_name(new_name: str):
         print(f"✗ Error updating map name: {e}")
         return False
 
+
 # ============================================================================
 # PRINT LOADED CONFIGURATION
 # ============================================================================
 
 if __name__ == "__main__":
-    print("\n=== VDA 5050 Configuration ===")
-    print(f"Manufacturer: {MANUFACTURER}")
-    print(f"Serial Number: {SERIAL_NUMBER}")
-    print(f"Map ID: {MAP_ID}")
-    print(f"VDA Version: {VDA_VERSION}")
-    print(f"\nNodes ({len(NODES)}):")
+    print("\n" + "=" * 50)
+    print("VDA 5050 Configuration")
+    print("=" * 50)
+
+    print(f"\n📡 MQTT Settings:")
+    print(f"   Broker: {MQTT_BROKER}")
+    print(f"   Port: {MQTT_PORT}")
+    print(f"   Username: {MQTT_USERNAME or '(none)'}")
+    print(f"   WebSocket: {MQTT_WEBSOCKET}")
+
+    print(f"\n🤖 Robot Identity:")
+    print(f"   Manufacturer: {MANUFACTURER}")
+    print(f"   Serial Number: {SERIAL_NUMBER}")
+    print(f"   Map ID: {MAP_ID}")
+    print(f"   VDA Version: {VDA_VERSION}")
+
+    print(f"\n🗺️ Nodes ({len(NODES)}):")
     for node_id, data in NODES.items():
-        print(f"  {node_id}: ({data['x']}, {data['y']})")
-    print(f"\nEdges ({len(EDGES)}):")
+        print(f"   {node_id}: ({data['x']}, {data['y']})")
+
+    print(f"\n🔗 Edges ({len(EDGES)}):")
     for edge in EDGES[:5]:
-        print(f"  {edge['start']} → {edge['end']}")
-    print(f"  ... and {len(EDGES) - 5} more")
+        print(f"   {edge['start']} → {edge['end']}")
+    if len(EDGES) > 5:
+        print(f"   ... and {len(EDGES) - 5} more")
+
+    print("=" * 50)

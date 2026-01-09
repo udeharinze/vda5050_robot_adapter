@@ -209,9 +209,9 @@ class DashboardApp:
         self.horizon_split = tk.IntVar(value=99)  # Default: all nodes in base
         self.horizon_slider = tk.Scale(horizon_row, from_=1, to=10, orient=tk.HORIZONTAL,
                                        variable=self.horizon_split, bg=COLOR_BG, fg="white",
-                                       highlightthickness=0, length=120, showvalue=True,
+                                       highlightthickness=0, length=245, showvalue=True,
                                        command=self.on_horizon_slider_change)
-        self.horizon_slider.pack(side=tk.LEFT, padx=3)
+        self.horizon_slider.pack(side=tk.LEFT, padx=4)
 
         self.horizon_label = tk.Label(horizon_row, text="(all released)", bg=COLOR_BG,
                                       fg="#4CAF50", font=("Arial", 8))
@@ -219,17 +219,17 @@ class DashboardApp:
 
         # Path builder buttons
         btn_frame = tk.Frame(path_frame, bg=COLOR_BG)
-        btn_frame.pack(fill=tk.X, padx=10, pady=3)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
 
         self.execute_btn = tk.Button(btn_frame, text="▶ Execute (Enter)", command=self.execute_path_click,
-                                     bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), width=14)
+                                     bg="#4CAF50", fg="white", font=("Arial", 9, "bold"), width=22)
         self.execute_btn.pack(side=tk.LEFT, padx=2)
 
         tk.Button(btn_frame, text="✕ Clear", command=self.clear_path_click,
-                  bg="#666", fg="white", font=("Arial", 9), width=8).pack(side=tk.LEFT, padx=2)
+                  bg="#666", fg="white", font=("Arial", 9), width=14).pack(side=tk.LEFT, padx=2)
 
         tk.Button(btn_frame, text="↩ Undo", command=self.undo_last_node_click,
-                  bg="#666", fg="white", font=("Arial", 9), width=7).pack(side=tk.LEFT, padx=2)
+                  bg="#666", fg="white", font=("Arial", 9), width=15).pack(side=tk.LEFT, padx=2)
 
         # ============================================================
         # MISSIONS (Predefined) - All on one row, compact
@@ -244,7 +244,7 @@ class DashboardApp:
         col = 0
         for name in MISSIONS.keys():
             btn = tk.Button(mission_btn_frame, text=name, command=lambda n=name: self.start_mission(n),
-                            bg="#444", fg="white", activebackground=COLOR_ACCENT, width=9, font=("Arial", 8))
+                            bg="#444", fg="white", activebackground=COLOR_ACCENT, width=15, font=("Arial", 8))
             btn.grid(row=0, column=col, padx=1, pady=1)
             col += 1
 
@@ -259,11 +259,11 @@ class DashboardApp:
         ctrl_btn_frame.pack(fill=tk.X, padx=10, pady=3)
 
         tk.Button(ctrl_btn_frame, text="⏸ Pause", command=self.backend.pause_mission,
-                  bg="#FFA000", fg="black", width=9, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
+                  bg="#FFA000", fg="black", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
         tk.Button(ctrl_btn_frame, text="▶ Resume", command=self.backend.resume_mission,
-                  bg="#4CAF50", fg="white", width=9, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
+                  bg="#4CAF50", fg="white", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=4)
         tk.Button(ctrl_btn_frame, text="⏹ Stop", command=self.stop_and_clear,
-                  bg="#F44336", fg="white", width=9, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
+                  bg="#F44336", fg="white", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
 
         # ============================================================
         # HORIZON MODE (VDA 5050 Base/Horizon) - Compact
@@ -325,11 +325,11 @@ class DashboardApp:
             # Check if this node connects to the last node via an edge
             last_node = self.selected_path[-1]
             if self._nodes_connected(last_node, node_id):
-                if node_id not in self.selected_path:  # Avoid loops for now
+                if node_id != last_node:  # Only prevent clicking same node twice in a row
                     self.selected_path.append(node_id)
                     self.log_message(f"Added: {node_id}", "info")
                 else:
-                    self.log_message(f"Node {node_id} already in path", "warning")
+                    self.log_message(f"Cannot add same node twice in a row", "warning")
             else:
                 self.log_message(f"No edge from {last_node} to {node_id}", "warning")
 
@@ -777,9 +777,21 @@ class DashboardApp:
 
             # Draw sequence number if in selected path
             if name in self.selected_path:
-                idx = self.selected_path.index(name) + 1
-                text_color = "white" if idx >= split else "black"
-                self.canvas.create_text(sx, sy, text=str(idx), fill=text_color, font=("Arial", 10, "bold"))
+                # Find ALL positions where this node appears
+                positions = [i + 1 for i, n in enumerate(self.selected_path) if n == name]
+
+                if len(positions) > 1:
+                    # Multiple occurrences - show as "1/3/5"
+                    display_text = "/".join(str(p) for p in positions)
+                    font_size = 8 if len(display_text) > 3 else 9
+                else:
+                    display_text = str(positions[0])
+                    font_size = 10
+
+                # Use first position to determine text color (base vs horizon)
+                first_idx = positions[0]
+                text_color = "white" if first_idx > split else "black"
+                self.canvas.create_text(sx, sy, text=display_text, fill=text_color, font=("Arial", font_size, "bold"))
 
             # Node label
             self.canvas.create_text(sx, sy - 22, text=name, fill="white", font=("Arial", 9, "bold"))

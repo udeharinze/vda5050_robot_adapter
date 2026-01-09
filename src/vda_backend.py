@@ -23,7 +23,8 @@ from typing import List, Optional, Dict, Any
 import paho.mqtt.client as mqtt
 from vda_config import (
     MQTT_BROKER, MQTT_PORT, MANUFACTURER, SERIAL_NUMBER, VDA_VERSION, MAP_ID,
-    NODES, EDGES, NAV
+    NODES, EDGES, NAV,
+    MQTT_USERNAME, MQTT_PASSWORD, MQTT_WEBSOCKET, MQTT_WS_PATH, MQTT_VERSION
 )
 
 # ============================================================================
@@ -38,16 +39,14 @@ CONNECTION_PUBLISH_INTERVAL = 1.0  # Publish connection every second
 ACTION_TIMEOUT_SEC = 10.0  # Timeout for actions like beep/locate
 
 # ============================================================================
-# MQTT TOPICS
+# MQTT TOPICS (VDA 5050 Standard)
 # ============================================================================
 
 TOPIC_ORDER = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/order"
 TOPIC_STATE = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/state"
 TOPIC_INSTANT_ACTIONS = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/instantActions"
 TOPIC_CONNECTION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/connection"
-
-TOPIC_BRIDGE_STATE = "vda5050/robot/state"
-TOPIC_BRIDGE_ACTION = "vda5050/robot/instantAction"
+TOPIC_VISUALIZATION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/visualization"
 
 
 # ============================================================================
@@ -190,7 +189,33 @@ class RobotBackend:
 
     def start(self):
         """Start MQTT client and main loop"""
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, f"vda_backend_{SERIAL_NUMBER}")
+        # Determine MQTT protocol version
+        if MQTT_VERSION == "3.1":
+            protocol = mqtt.MQTTv31
+            self.log("📋 Using MQTT protocol v3.1", "info")
+        elif MQTT_VERSION == "3.1.1":
+            protocol = mqtt.MQTTv311
+            self.log("📋 Using MQTT protocol v3.1.1", "info")
+        else:
+            protocol = mqtt.MQTTv5
+            self.log("📋 Using MQTT protocol v5.0", "info")
+
+        # Create MQTT client - use WebSocket transport if configured
+        if MQTT_WEBSOCKET:
+            self.client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION2,
+                f"vda_backend_{SERIAL_NUMBER}",
+                transport="websockets",
+                protocol=protocol
+            )
+            self.log("🌐 Using WebSocket transport", "info")
+        else:
+            self.client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION2,
+                f"vda_backend_{SERIAL_NUMBER}",
+                protocol=protocol
+            )
+
         self.client.on_connect = self._on_connect
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
@@ -206,7 +231,28 @@ class RobotBackend:
         }
         self.client.will_set(TOPIC_CONNECTION, json.dumps(last_will), qos=1, retain=True)
 
+        # === AUTHENTICATION ===
+        if MQTT_USERNAME and MQTT_PASSWORD:
+            self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+            self.log(f"🔐 MQTT auth enabled for user: {MQTT_USERNAME}", "info")
+
+        # === TLS/SSL ENCRYPTION ===
+        if MQTT_WEBSOCKET:
+            import ssl
+            # Create SSL context that doesn't verify certificates (for development)
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            self.client.tls_set_context(ssl_context)
+            self.log("🔒 TLS encryption enabled", "info")
+
+        # === WEBSOCKET PATH ===
+        if MQTT_WEBSOCKET and MQTT_WS_PATH:
+            self.client.ws_set_options(path=MQTT_WS_PATH)
+            self.log(f"🌐 WebSocket path: {MQTT_WS_PATH}", "info")
+
         self.log(f"🎯 VDA5050 Backend starting...", "info")
+        self.log(f"📡 Connecting to {self.broker}:{self.port}", "info")
 
         try:
             self.client.connect(self.broker, self.port, 60)
@@ -234,7 +280,7 @@ class RobotBackend:
 
                 # Subscribe to topics
             client.subscribe(TOPIC_ORDER)
-            client.subscribe(TOPIC_BRIDGE_STATE)
+            client.subscribe(TOPIC_VISUALIZATION)
             client.subscribe(TOPIC_INSTANT_ACTIONS)
 
             # Publish ONLINE connection state (with logging)
@@ -255,8 +301,8 @@ class RobotBackend:
 
             if msg.topic == TOPIC_ORDER:
                 self._handle_order(payload)
-            elif msg.topic == TOPIC_BRIDGE_STATE:
-                self._handle_bridge_state(payload)
+            elif msg.topic == TOPIC_VISUALIZATION:
+                self._handle_visualization(payload)
             elif msg.topic == TOPIC_INSTANT_ACTIONS:
                 self._handle_instant_actions(payload)
 
@@ -287,11 +333,11 @@ class RobotBackend:
             self.log(f"📡 Connection: {state}", "info")
 
     # ========================================================================
-    # BRIDGE STATE HANDLING
+    # VISUALIZATION HANDLING (Robot Position from Bridge)
     # ========================================================================
 
-    def _handle_bridge_state(self, payload: Dict):
-        """Update internal state from Valetudo bridge"""
+    def _handle_visualization(self, payload: Dict):
+        """Update internal state from visualization topic (sent by bridge)"""
         pos = payload.get("agvPosition", {})
         if pos:
             new_x = pos.get("x")
@@ -827,7 +873,7 @@ class RobotBackend:
             "serialNumber": SERIAL_NUMBER,
             "actions": [action]
         }
-        self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def _update_action_state(self, action_id: str, status: str, result: str = ""):
         """Update action state"""
@@ -936,7 +982,7 @@ class RobotBackend:
         }
 
         self.log(f"📤 goTo: {node_id} ({int(target['x'])}, {int(target['y'])})", "info")
-        self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def _send_dock_command(self):
         """Send dock command"""
@@ -953,7 +999,7 @@ class RobotBackend:
                 "actionParameters": []
             }]
         }
-        self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def _complete_mission(self):
         """Complete mission"""
@@ -1089,6 +1135,15 @@ class RobotBackend:
         actions = payload.get("actions", [])
         for action in actions:
             action_type = action.get("actionType", "")
+
+            # Ignore actions that the backend sends itself (goTo, dock, etc.)
+            # These are already sent to bridge via the same topic
+            if action_type in ["goTo", "dock", "quickCharge", "beep", "locate",
+                               "startCleaning", "stopCleaning", "pauseCleaning",
+                               "setFanSpeed", "stopMovement", "pauseMovement", "resumeMovement"]:
+                # Bridge handles these directly - don't log or re-publish
+                return
+
             self.log(f"📥 Instant Action: {action_type}", "info")
 
             if action_type == "stopPause" or action_type == "resumeOrder":
@@ -1097,9 +1152,6 @@ class RobotBackend:
                 self.pause_mission()
             elif action_type == "cancelOrder":
                 self.emergency_stop()
-            else:
-                # Forward other actions to bridge
-                self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(payload))
 
     # ========================================================================
     # STATE PUBLISHING
@@ -1164,6 +1216,56 @@ class RobotBackend:
 
         self.client.publish(TOPIC_STATE, json.dumps(state))
 
+    def _publish_current_order(self):
+        """Publish current order to MQTT for visibility/debugging"""
+        if not self.client or not self.node_states:
+            return
+
+        # Build nodes with positions
+        nodes_list = []
+        for ns in self.node_states:
+            node_dict = {
+                "nodeId": ns.nodeId,
+                "sequenceId": ns.sequenceId,
+                "released": ns.released,
+                "actions": []
+            }
+            # Add position if available
+            if ns.nodeId in NODES:
+                node_dict["nodePosition"] = {
+                    "x": NODES[ns.nodeId]["x"],
+                    "y": NODES[ns.nodeId]["y"],
+                    "mapId": MAP_ID
+                }
+            nodes_list.append(node_dict)
+
+        # Build edges
+        edges_list = []
+        for es in self.edge_states:
+            edges_list.append({
+                "edgeId": es.edgeId,
+                "sequenceId": es.sequenceId,
+                "startNodeId": es.startNodeId,
+                "endNodeId": es.endNodeId,
+                "released": es.released,
+                "actions": []
+            })
+
+        order = {
+            "headerId": self._next_header_id(),
+            "timestamp": self._get_timestamp(),
+            "version": VDA_VERSION,
+            "manufacturer": MANUFACTURER,
+            "serialNumber": SERIAL_NUMBER,
+            "orderId": self.order_id,
+            "orderUpdateId": self.order_update_id,
+            "nodes": nodes_list,
+            "edges": edges_list
+        }
+
+        self.client.publish(TOPIC_ORDER, json.dumps(order))
+        self.log(f"📤 Order published to MQTT", "info")
+
     # ========================================================================
     # GUI CONTROLS - PAUSE/RESUME/STOP
     # ========================================================================
@@ -1187,7 +1289,7 @@ class RobotBackend:
                 "actionParameters": []
             }]
         }
-        self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def resume_mission(self):
         """Resume mission - sends resume command to robot"""
@@ -1209,7 +1311,7 @@ class RobotBackend:
                     "actionParameters": []
                 }]
             }
-            self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+            self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
             # If we have a current target, resend navigation command
             if self.current_target_node and not self.waiting_at_decision_point:
@@ -1233,7 +1335,7 @@ class RobotBackend:
                 "actionParameters": []
             }]
         }
-        self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
         # Clear order state
         self.mission_active = False
@@ -1291,7 +1393,7 @@ class RobotBackend:
                     "actionParameters": []
                 }]
             }
-            self.client.publish(TOPIC_BRIDGE_ACTION, json.dumps(action_msg))
+            self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
             self.log(f"📤 Instant action: {actual_action}", "info")
 
     # ========================================================================
@@ -1361,6 +1463,9 @@ class RobotBackend:
             self.mission_active = True
             self.paused = False
             self.waiting_at_decision_point = False
+
+            # Publish order to MQTT for visibility
+            self._publish_current_order()
 
             self._advance_mission()
 
@@ -1458,6 +1563,9 @@ class RobotBackend:
             self.mission_active = True
             self.paused = False
             self.waiting_at_decision_point = False
+
+            # Publish order to MQTT for visibility
+            self._publish_current_order()
 
             self._advance_mission()
 
