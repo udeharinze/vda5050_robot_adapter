@@ -24,10 +24,12 @@ from vda_config import (
 # --- VDA 5050 TOPICS ---
 TOPIC_VISUALIZATION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/visualization"
 TOPIC_INSTANT_ACTIONS = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/instantActions"
+TOPIC_ORDER = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/order"  # ISSUE 1 FIX: Subscribe to order topic
 
 # --- CONFIGURATION ---
 ROBOT_IP = "192.168.178.69"  # UPDATE with your robot's IP
 STATE_INTERVAL = 5
+ARRIVAL_TOLERANCE_MM = 75  # Distance threshold to consider robot "at" a node
 
 print(f"Bridge is configured for Robot IP: {ROBOT_IP}")
 
@@ -111,7 +113,7 @@ def get_robot_data():
 
 
 def loop_state_and_visualization(mqtt_client):
-    """Publishes the robot's full state AND visualization data."""
+    """Publishes the robot's full state AND visualization data, with arrival detection."""
     header_id_counter = 0
     debug_printed = False
 
@@ -152,6 +154,11 @@ def loop_state_and_visualization(mqtt_client):
             }
             mqtt_client.publish(TOPIC_VISUALIZATION, json.dumps(vda_vis))
 
+            # ============================================================
+            # ARRIVAL DETECTION - Check if we've arrived at current target
+            # ============================================================
+            check_arrival_and_advance(data["x"], data["y"], data["driving"])
+
             # Print state (only show debug once)
             if not debug_printed:
                 debug_printed = True
@@ -175,12 +182,176 @@ def on_connect(client, userdata, flags, reason_code, properties):
         BRIDGE_START_TIME = datetime.now(timezone.utc)
         print(f"⏰ Bridge start time: {BRIDGE_START_TIME.isoformat()}")
 
+        # ISSUE 1 FIX: Subscribe to order topic for navigation
+        client.subscribe(TOPIC_ORDER)
+        print(f"✓ Subscribed to {TOPIC_ORDER}")
+
         client.subscribe(TOPIC_INSTANT_ACTIONS)
         print(f"✓ Subscribed to {TOPIC_INSTANT_ACTIONS}")
 
 
 # Track when bridge started (to ignore old retained messages)
 BRIDGE_START_TIME = None
+
+# ============================================================================
+# ISSUE 1 FIX: Order state tracking for navigation
+# ============================================================================
+ORDER_STATE = {
+    "order_id": 0,  # Numeric order ID (0 = no order)
+    "order_update_id": 0,
+    "nodes": [],  # List of all nodes in current order
+    "current_node_idx": 0,  # Index of node we're currently navigating to
+    "active": False,  # Whether we're actively navigating an order
+    "current_target": None  # {"nodeId": "...", "x": ..., "y": ...} - current navigation target
+}
+
+
+def check_arrival_and_advance(robot_x, robot_y, is_driving):
+    """
+    Check if robot has arrived at current target node.
+    If arrived and not driving, advance to next node.
+    """
+    global ORDER_STATE
+
+    if not ORDER_STATE["active"] or ORDER_STATE["current_target"] is None:
+        return
+
+    target = ORDER_STATE["current_target"]
+    target_x = target.get("x", 0)
+    target_y = target.get("y", 0)
+    target_id = target.get("nodeId", "?")
+
+    # Calculate distance to target
+    distance = math.sqrt((robot_x - target_x) ** 2 + (robot_y - target_y) ** 2)
+
+    # Check if arrived (within tolerance and not driving)
+    if distance < ARRIVAL_TOLERANCE_MM and not is_driving:
+        print(f"\n✅ ARRIVED at node: {target_id} (distance: {distance:.0f}mm)")
+        ORDER_STATE["current_target"] = None
+
+        # Navigate to next node
+        navigate_to_next_node()
+
+
+def handle_order_message(vda_message):
+    """
+    ISSUE 1 FIX: Handle order messages from /order topic.
+    Extract nodes and navigate to released nodes.
+    """
+    global ORDER_STATE
+
+    order_id = vda_message.get("orderId", 0)
+    order_update_id = vda_message.get("orderUpdateId", 0)
+    nodes = vda_message.get("nodes", [])
+
+    # Check if this is an echo (same order, same update ID) - silently ignore
+    is_echo = (order_id == ORDER_STATE["order_id"] and
+               order_update_id == ORDER_STATE["order_update_id"])
+    if is_echo:
+        return
+
+    print(f"\n📥 ORDER received: #{order_id} (updateId: {order_update_id})")
+
+    # Check if this is a new order or an update
+    is_new_order = (order_id != ORDER_STATE["order_id"])
+    is_update = (order_id == ORDER_STATE["order_id"] and
+                 order_update_id > ORDER_STATE["order_update_id"])
+
+    if is_new_order:
+        prev_id = ORDER_STATE['order_id'] if ORDER_STATE['order_id'] else 'none'
+        print(f"   🆕 New order (replacing: #{prev_id})")
+        ORDER_STATE["order_id"] = order_id
+        ORDER_STATE["order_update_id"] = order_update_id
+        ORDER_STATE["nodes"] = nodes
+        ORDER_STATE["current_node_idx"] = 0
+        ORDER_STATE["active"] = True
+        ORDER_STATE["current_target"] = None
+
+    elif is_update:
+        print(f"   📝 Order update: {ORDER_STATE['order_update_id']} → {order_update_id}")
+        ORDER_STATE["order_update_id"] = order_update_id
+        ORDER_STATE["nodes"] = nodes
+        # Don't reset current_node_idx - continue where we were
+        # But DO reactivate navigation (horizon release case)
+        ORDER_STATE["active"] = True
+        print(f"   ▶ Reactivating navigation (horizon may have been released)")
+
+    else:
+        # Strictly older update - warn and ignore
+        print(f"   ⚠ Old update ignored (have: {ORDER_STATE['order_update_id']}, got: {order_update_id})")
+        return
+
+    # Log nodes
+    released_nodes = [n for n in nodes if n.get("released", True)]
+    horizon_nodes = [n for n in nodes if not n.get("released", True)]
+    print(f"   Nodes: {len(released_nodes)} released, {len(horizon_nodes)} in horizon")
+
+    # Navigate to next released node we haven't visited yet
+    navigate_to_next_node()
+
+
+def navigate_to_next_node():
+    """Navigate to the next released node in the order."""
+    global ORDER_STATE
+
+    if not ORDER_STATE["active"]:
+        return
+
+    nodes = ORDER_STATE["nodes"]
+    idx = ORDER_STATE["current_node_idx"]
+
+    # Find next released node
+    while idx < len(nodes):
+        node = nodes[idx]
+        if node.get("released", True):
+            node_id = node.get("nodeId", "")
+            node_pos = node.get("nodePosition", {})
+            seq_id = node.get("sequenceId", 0)
+
+            x = node_pos.get("x")
+            y = node_pos.get("y")
+
+            if x is not None and y is not None:
+                print(f"   🎯 Navigating to node: {node_id} (seq: {seq_id}) at ({x}, {y})")
+
+                # Track current target for arrival detection
+                ORDER_STATE["current_target"] = {
+                    "nodeId": node_id,
+                    "x": x,
+                    "y": y
+                }
+
+                # Check if this is the home/dock node
+                if node_id.lower() == "home":
+                    print(f"   🏠 Home node - sending dock command")
+                    actions_basic.handle_dock(ROBOT_IP)
+                else:
+                    # Send goTo command via actions_navigation
+                    params = [
+                        {"key": "x", "value": x},
+                        {"key": "y", "value": y},
+                        {"key": "targetNodeId", "value": node_id}
+                    ]
+                    actions_navigation.handle_goto(ROBOT_IP, params)
+
+                ORDER_STATE["current_node_idx"] = idx + 1
+                return
+            else:
+                print(f"   ⚠ Node {node_id} has no position, skipping")
+        else:
+            print(f"   ⏸ Node {node.get('nodeId', '?')} not released (horizon)")
+            # Stop here - wait for horizon release
+            ORDER_STATE["active"] = False
+            ORDER_STATE["current_target"] = None
+            print(f"   ⏸ Waiting at decision point for horizon release")
+            return
+
+        idx += 1
+
+    # All nodes processed
+    print(f"   ✅ Order #{ORDER_STATE['order_id']} complete")
+    ORDER_STATE["active"] = False
+    ORDER_STATE["current_target"] = None
 
 
 def on_message(client, userdata, msg):
@@ -203,6 +374,12 @@ def on_message(client, userdata, msg):
             except:
                 pass  # If parsing fails, process anyway
 
+        # ISSUE 1 FIX: Route messages based on topic
+        if msg.topic == TOPIC_ORDER:
+            handle_order_message(vda_message)
+            return
+
+        # Handle instant actions (non-navigation commands)
         for vda_action in vda_message.get('actions', []):
             action_type = vda_action.get('actionType')
             print(f"\nReceived VDA action: {action_type}")
@@ -226,6 +403,8 @@ def on_message(client, userdata, msg):
                         speed = param['value']
                 actions_basic.handle_set_fan_speed(ROBOT_IP, speed)
             elif action_type == 'goTo':
+                # ISSUE 1 NOTE: goTo on /instantActions still works for backward compatibility
+                # and for GUI direct commands, but primary navigation should come via /order
                 actions_navigation.handle_goto(ROBOT_IP, vda_action.get('actionParameters', []))
             elif action_type == 'stopMovement':
                 # Stop the robot using Valetudo API
@@ -242,7 +421,9 @@ def on_message(client, userdata, msg):
             time.sleep(0.1)
 
     except Exception as e:
-        print(f"Error processing action message: {e}")
+        print(f"Error processing message: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def handle_stop(robot_ip):

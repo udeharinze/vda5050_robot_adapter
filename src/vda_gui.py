@@ -630,10 +630,17 @@ class DashboardApp:
         current = self._get_current_node()
         self.vars["current_node"].set(current or "--")
 
-        # Order
+        # Order - display both orderId and orderUpdateId
         if self.backend.current_order:
-            order_id = self.backend.current_order.get("orderId", "--")
-            self.vars["order"].set(order_id[:20] if len(order_id) > 20 else order_id)
+            order_id = self.backend.current_order.get("orderId", 0)
+            update_id = self.backend.current_order.get("orderUpdateId", 0)
+            # Handle both numeric and string order IDs
+            order_display = f"#{order_id} (upd: {update_id})"
+            self.vars["order"].set(order_display)
+        elif self.backend.order_id and self.backend.order_id > 0:
+            # Order completed but ID retained (Issue 2 fix)
+            order_display = f"#{self.backend.order_id} (done)"
+            self.vars["order"].set(order_display)
         else:
             self.vars["order"].set("--")
 

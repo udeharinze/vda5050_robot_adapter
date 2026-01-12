@@ -140,8 +140,9 @@ class RobotBackend:
 
         # VDA5050 Order State
         self.current_order: Optional[Dict] = None
-        self.order_id = ""
+        self.order_id = 0  # Numeric order ID (increments with each new order)
         self.order_update_id = 0
+        self._order_id_counter = 0  # Counter for generating unique order IDs (never decreases)
         self.last_node_id = None  # Will be set on first command based on actual position
         self.last_node_sequence_id = 0
 
@@ -546,28 +547,45 @@ class RobotBackend:
 
     def _handle_order(self, order: Dict):
         """Handle incoming VDA5050 order"""
-        incoming_order_id = order.get("orderId", "")
+        incoming_order_id = order.get("orderId", 0)
         incoming_update_id = order.get("orderUpdateId", 0)
 
-        self.log(f"📥 ORDER: {incoming_order_id} (update: {incoming_update_id})", "info")
-
         with self.lock:
+            # Same order ID - check if it's an update or echo
             if incoming_order_id == self.order_id:
-                if incoming_update_id <= self.order_update_id:
-                    self.log(f"   ⚠ Old update ignored", "warning")
+                if incoming_update_id < self.order_update_id:
+                    # Strictly older update - ignore with warning
+                    self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
+                    self.log(f"   ⚠ Old update ignored (current: {self.order_update_id})", "warning")
                     return
-                self.log(f"   📝 ORDER UPDATE", "info")
-                self._process_order_update(order)
+                elif incoming_update_id == self.order_update_id:
+                    # Same update ID - this is our own message echoing back, silently ignore
+                    return
+                else:
+                    # Newer update ID - process the update
+                    self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
+                    self.log(f"   📝 ORDER UPDATE", "info")
+                    self._process_order_update(order)
             else:
+                # Different order ID - new order
+                self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
                 if self.mission_active:
                     self.log(f"   ⏹ Cancelling previous order", "warning")
                 self._process_new_order(order)
 
     def _process_new_order(self, order: Dict):
-        """Process a new VDA5050 order"""
-        self.order_id = order.get("orderId", "")
+        """Process a new VDA5050 order (from Flexus or external master control)"""
+        incoming_order_id = order.get("orderId", 0)
+        self.order_id = incoming_order_id
         self.order_update_id = order.get("orderUpdateId", 0)
         self.current_order = order
+
+        # If Flexus sends a numeric orderId, update our counter to avoid conflicts
+        # This ensures GUI orders will always have higher IDs than Flexus orders
+        if isinstance(incoming_order_id, int) and incoming_order_id >= self._order_id_counter:
+            self._order_id_counter = incoming_order_id
+
+        self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
 
         self._reset_gui_colors()
         self.action_states = []  # Clear action states
@@ -933,17 +951,29 @@ class RobotBackend:
             self._send_navigation_command(next_node)
 
     def _send_navigation_command(self, node_id: str):
-        """Send goTo or dock command"""
+        """
+        Trigger navigation to a node.
+
+        With the new architecture (Issue 1 fix):
+        - Backend publishes order on /order topic
+        - Bridge subscribes to /order and sends goTo to robot
+        - Backend just tracks state
+        """
         self.last_command_ts = time.time()
 
         if node_id == "home":
-            self.log(f"📤 DOCK command (home)", "info")
+            # Dock command still goes via /instantActions (bridge handles it)
+            self.log(f"🏠 Navigating to: home (dock command)", "info")
             self._send_dock_command()
         else:
             self._send_goto(node_id)
 
     def _send_goto(self, node_id: str):
-        """Send goTo command"""
+        """
+        ISSUE 1 FIX: Backend no longer sends goTo on /instantActions.
+        Navigation is handled by bridge reading from /order topic.
+        This method publishes the order and logs the navigation intent.
+        """
         target = None
 
         # First try: Get from order's nodePosition
@@ -963,29 +993,15 @@ class RobotBackend:
             self.log(f"✗ Unknown node: {node_id} (not in order or config)", "error")
             return
 
-        action_msg = {
-            "headerId": self._next_header_id(),
-            "timestamp": self._get_timestamp(),
-            "version": VDA_VERSION,
-            "manufacturer": MANUFACTURER,
-            "serialNumber": SERIAL_NUMBER,
-            "actions": [{
-                "actionType": "goTo",
-                "actionId": f"goTo_{node_id}_{int(time.time() * 1000)}",
-                "blockingType": "HARD",
-                "actionParameters": [
-                    {"key": "x", "value": target["x"]},
-                    {"key": "y", "value": target["y"]},
-                    {"key": "targetNodeId", "value": node_id}
-                ]
-            }]
-        }
+        # Log what's happening with the new architecture
+        self.log(f"🎯 Navigating to: {node_id} ({int(target['x'])}, {int(target['y'])})", "info")
+        self.log(f"   📤 Publishing order on /order → Bridge will send goTo to robot", "info")
 
-        self.log(f"📤 goTo: {node_id} ({int(target['x'])}, {int(target['y'])})", "info")
-        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
+        # Publish order so bridge can navigate
+        self._publish_current_order()
 
     def _send_dock_command(self):
-        """Send dock command"""
+        """Send dock command - this still goes via /instantActions"""
         action_msg = {
             "headerId": self._next_header_id(),
             "timestamp": self._get_timestamp(),
@@ -1003,21 +1019,21 @@ class RobotBackend:
 
     def _complete_mission(self):
         """Complete mission"""
-        self.log(f"✅ ORDER COMPLETE: {self.order_id}", "success")
+        self.log(f"✅ ORDER COMPLETE: Order #{self.order_id}", "success")
         self.mission_active = False
         self.current_target_node = None
         self.waiting_at_decision_point = False
         self.new_base_request = False
 
-        # Clear VDA 5050 state
+        # Clear VDA 5050 state (nodes/edges completed)
         self.node_states = []
         self.edge_states = []
         self.action_states = []
 
-        # Clear order info
-        self.current_order = None
-        self.order_id = ""
-        self.order_update_id = 0
+        # ISSUE 2 FIX: Keep orderId and orderUpdateId until NEW order received
+        # Do NOT reset: self.order_id, self.order_update_id, self.current_order
+        # These will be cleared when a new order is received in _process_new_order()
+        self.log(f"   📋 Keeping Order #{self.order_id} until new order arrives", "info")
 
         # Reset all node colors to idle
         self._reset_gui_colors()
@@ -1343,8 +1359,9 @@ class RobotBackend:
         self.mission_queue = []
         self.current_target_node = None
         self.waiting_at_decision_point = False
-        self.current_order = None
-        self.order_id = ""
+        # ISSUE 2 FIX: Keep orderId until new order received
+        # self.current_order = None  # Keep reference
+        # self.order_id = ""  # Keep ID
         self.node_states = []
         self.edge_states = []
         self.action_states = []
@@ -1417,10 +1434,13 @@ class RobotBackend:
 
             self._reset_gui_colors()
 
-            # Use simple readable order ID for GUI missions
-            self.order_id = "GUI_Order"
-            self.order_update_id = 0
+            # Generate new numeric order ID (always increments, never goes back)
+            self._order_id_counter += 1
+            self.order_id = self._order_id_counter
+            self.order_update_id = 0  # Reset to 0 for new order
             self.current_order = {"orderId": self.order_id, "orderUpdateId": 0}
+
+            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
 
             self.node_states = []
             self.edge_states = []
@@ -1496,17 +1516,18 @@ class RobotBackend:
                 self.log(f"🎯 Mission with Horizon:", "info")
                 self.log(f"   Base ({base_count}): {' → '.join(path[:base_count])}", "info")
                 self.log(f"   Horizon ({horizon_count}): {' → '.join(path[base_count:])}", "warning")
-                order_name = "GUI_Horizon_Order"
             else:
                 self.log(f"🎯 GUI Mission: {' → '.join(path)}", "info")
-                order_name = "GUI_Order"
 
             self._reset_gui_colors()
 
-            # Use simple readable order ID for GUI missions
-            self.order_id = order_name
-            self.order_update_id = 0
+            # Generate new numeric order ID (always increments, never goes back)
+            self._order_id_counter += 1
+            self.order_id = self._order_id_counter
+            self.order_update_id = 0  # Reset to 0 for new order
             self.current_order = {"orderId": self.order_id, "orderUpdateId": 0}
+
+            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
 
             self.node_states = []
             self.edge_states = []
@@ -1604,6 +1625,10 @@ class RobotBackend:
             self.order_update_id += 1
             if self.current_order:
                 self.current_order["orderUpdateId"] = self.order_update_id
+
+            # ISSUE 3 FIX: Publish order update on /order topic
+            self._publish_current_order()
+            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
 
             # Add released node to mission queue
             self.mission_queue.append(first_horizon.nodeId)
