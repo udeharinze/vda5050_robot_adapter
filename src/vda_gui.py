@@ -1,12 +1,12 @@
 # ============================================================================
-# vda_gui.py - VDA 5050 Robot Dashboard GUI
+# vda_gui_refactored.py - VDA 5050 Robot Dashboard GUI (REFACTORED)
 # ============================================================================
 #
-# Features:
-#   - Path Builder Mode: Click nodes to build path, Enter to execute
-#   - Horizon Mode: Visualize base/horizon, manual release
-#   - Current position detection on startup
-#   - Pan/Zoom with mouse
+# CHANGES FROM ORIGINAL:
+#   - Batch horizon release: Enter count (1-10) to release N nodes at once
+#   - "Release All" button to release entire horizon
+#   - Enhanced status display showing waiting state
+#   - Spinbox max auto-updates to match available horizon nodes
 #
 # ============================================================================
 
@@ -16,6 +16,7 @@ import json
 import math
 import os
 from vda_config import *
+# NOTE: Change this import to use refactored backend
 from vda_backend import RobotBackend
 
 
@@ -151,7 +152,7 @@ class DashboardApp:
 
     def create_sidebar(self, sidebar):
         # ============================================================
-        # ROBOT STATUS - Compact
+        # ROBOT STATUS - Compact side-by-side layout
         # ============================================================
         status_frame = tk.LabelFrame(sidebar, text="ROBOT STATUS", bg=COLOR_BG, fg=COLOR_ACCENT,
                                      font=("Arial", 12, "bold"))
@@ -166,21 +167,43 @@ class DashboardApp:
             "order": tk.StringVar(value="--")
         }
 
-        labels = [
-            ("Position:", "pos"),
-            ("Theta:", "theta"),
-            ("Battery:", "batt"),
-            ("Status:", "status"),
-            ("Current Node:", "current_node"),
-            ("Order:", "order")
-        ]
-        for label, var in labels:
-            row = tk.Frame(status_frame, bg=COLOR_BG)
-            row.pack(fill=tk.X, padx=10, pady=1)
-            tk.Label(row, text=label, bg=COLOR_BG, fg="white", font=("Arial", 9), width=12, anchor="w").pack(
-                side=tk.LEFT)
-            tk.Label(row, textvariable=self.vars[var], bg=COLOR_BG, fg=COLOR_ACCENT,
-                     font=("Arial", 9, "bold")).pack(side=tk.LEFT)
+        # Row 1: Position | Theta | Battery
+        row1 = tk.Frame(status_frame, bg=COLOR_BG)
+        row1.pack(fill=tk.X, padx=5, pady=1)
+
+        tk.Label(row1, text="Pos:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=4, anchor="w").pack(side=tk.LEFT)
+        tk.Label(row1, textvariable=self.vars["pos"], bg=COLOR_BG, fg=COLOR_ACCENT,
+                 font=("Arial", 8, "bold"), width=14, anchor="w").pack(side=tk.LEFT)
+
+        tk.Label(row1, text="θ:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=2, anchor="w").pack(side=tk.LEFT)
+        tk.Label(row1, textvariable=self.vars["theta"], bg=COLOR_BG, fg=COLOR_ACCENT,
+                 font=("Arial", 8, "bold"), width=14, anchor="w").pack(side=tk.LEFT)
+
+        tk.Label(row1, text="Batt:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=4, anchor="w").pack(side=tk.LEFT)
+        tk.Label(row1, textvariable=self.vars["batt"], bg=COLOR_BG, fg=COLOR_ACCENT,
+                 font=("Arial", 8, "bold")).pack(side=tk.LEFT)
+
+        # Row 2: Status | Current Node
+        row2 = tk.Frame(status_frame, bg=COLOR_BG)
+        row2.pack(fill=tk.X, padx=5, pady=1)
+
+        tk.Label(row2, text="Status:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=6, anchor="w").pack(
+            side=tk.LEFT)
+        tk.Label(row2, textvariable=self.vars["status"], bg=COLOR_BG, fg=COLOR_ACCENT,
+                 font=("Arial", 8, "bold"), width=12, anchor="w").pack(side=tk.LEFT)
+
+        tk.Label(row2, text="Node:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=5, anchor="w").pack(side=tk.LEFT)
+        tk.Label(row2, textvariable=self.vars["current_node"], bg=COLOR_BG, fg=COLOR_ACCENT,
+                 font=("Arial", 8, "bold")).pack(side=tk.LEFT)
+
+        # Row 3: Order
+        row3 = tk.Frame(status_frame, bg=COLOR_BG)
+        row3.pack(fill=tk.X, padx=5, pady=1)
+
+        tk.Label(row3, text="Order:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=6, anchor="w").pack(
+            side=tk.LEFT)
+        tk.Label(row3, textvariable=self.vars["order"], bg=COLOR_BG, fg=COLOR_ACCENT,
+                 font=("Arial", 8, "bold")).pack(side=tk.LEFT)
 
         # ============================================================
         # PATH BUILDER - Compact
@@ -258,29 +281,53 @@ class DashboardApp:
         ctrl_btn_frame = tk.Frame(ctrl_frame, bg=COLOR_BG)
         ctrl_btn_frame.pack(fill=tk.X, padx=10, pady=3)
 
-        tk.Button(ctrl_btn_frame, text="⏸ Pause", command=self.backend.pause_mission,
+        tk.Button(ctrl_btn_frame, text="⏹ Stop", command=self.backend.pause_mission,
                   bg="#FFA000", fg="black", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
         tk.Button(ctrl_btn_frame, text="▶ Resume", command=self.backend.resume_mission,
                   bg="#4CAF50", fg="white", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=4)
-        tk.Button(ctrl_btn_frame, text="⏹ Stop", command=self.stop_and_clear,
+        tk.Button(ctrl_btn_frame, text="✕ cancelOrder", command=self.stop_and_clear,
                   bg="#F44336", fg="white", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
 
         # ============================================================
-        # HORIZON MODE (VDA 5050 Base/Horizon) - Compact
+        # HORIZON MODE (VDA 5050 Base/Horizon) - REFACTORED WITH BATCH RELEASE
         # ============================================================
         horizon_frame = tk.LabelFrame(sidebar, text="HORIZON MODE", bg=COLOR_BG, fg="#4444AA",
                                       font=("Arial", 12, "bold"))
         horizon_frame.pack(fill=tk.X, pady=3)
 
-        horizon_inner = tk.Frame(horizon_frame, bg=COLOR_BG)
-        horizon_inner.pack(fill=tk.X, padx=10, pady=3)
+        # Status row
+        horizon_status_row = tk.Frame(horizon_frame, bg=COLOR_BG)
+        horizon_status_row.pack(fill=tk.X, padx=10, pady=3)
 
-        self.horizon_status = tk.Label(horizon_inner, text="No active order",
+        self.horizon_status = tk.Label(horizon_status_row, text="No active order",
                                        bg=COLOR_BG, fg="#888", font=("Arial", 9))
         self.horizon_status.pack(side=tk.LEFT)
 
-        tk.Button(horizon_inner, text="Release Next", command=self.release_next_horizon,
-                  bg="#4444AA", fg="white", width=12, font=("Arial", 9)).pack(side=tk.RIGHT, padx=2)
+        # Control row with count input and release buttons
+        horizon_ctrl_row = tk.Frame(horizon_frame, bg=COLOR_BG)
+        horizon_ctrl_row.pack(fill=tk.X, padx=10, pady=3)
+
+        tk.Label(horizon_ctrl_row, text="Release count:", bg=COLOR_BG, fg="#888",
+                 font=("Arial", 9)).pack(side=tk.LEFT)
+
+        # Spinbox for selecting number of nodes to release (1-10)
+        self.horizon_release_count = tk.IntVar(value=1)
+        self.horizon_spinbox = tk.Spinbox(
+            horizon_ctrl_row,
+            from_=1, to=10,
+            textvariable=self.horizon_release_count,
+            width=4,
+            font=("Arial", 9),
+            bg="#333", fg="white",
+            buttonbackground="#4444AA"
+        )
+        self.horizon_spinbox.pack(side=tk.LEFT, padx=5)
+
+        tk.Button(horizon_ctrl_row, text="Release", command=self.release_horizon_batch,
+                  bg="#4444AA", fg="white", width=17, font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(horizon_ctrl_row, text="Release All", command=self.release_all_horizon,
+                  bg="#6666CC", fg="white", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
 
         # ============================================================
         # LOG - Increased height
@@ -290,7 +337,7 @@ class DashboardApp:
         log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
         self.log_text = tk.Text(log_frame, bg="#1a1a1a", fg="white", font=("Consolas", 9),
-                                height=18, state='disabled', wrap=tk.WORD)
+                                height=22, state='disabled', wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.log_text.tag_config("info", foreground="#888")
         self.log_text.tag_config("success", foreground="#4CAF50")
@@ -482,11 +529,11 @@ class DashboardApp:
         self.update_path_display()
 
     # ========================================================================
-    # HORIZON MODE
+    # HORIZON MODE - BATCH RELEASE (REFACTORED)
     # ========================================================================
 
-    def release_next_horizon(self):
-        """Release the next horizon node"""
+    def release_horizon_batch(self):
+        """Release N horizon nodes based on spinbox value"""
         if not self.backend.node_states:
             self.log_message("No active order", "info")
             return
@@ -498,12 +545,43 @@ class DashboardApp:
             self.log_message("No horizon nodes to release", "info")
             return
 
-        # Release the first horizon node
-        next_horizon = horizon_nodes[0]
-        self.log_message(f"Releasing: {next_horizon.nodeId}", "success")
+        # Get count from spinbox
+        count = self.horizon_release_count.get()
+        count = min(count, len(horizon_nodes))  # Don't exceed available
 
-        # Call backend to release
-        self.backend.release_horizon_node(next_horizon.nodeId)
+        if count == 1:
+            self.log_message(f"Releasing: {horizon_nodes[0].nodeId}", "success")
+        else:
+            node_names = [ns.nodeId for ns in horizon_nodes[:count]]
+            self.log_message(f"Releasing {count} nodes: {' → '.join(node_names)}", "success")
+
+        # Call backend to release N nodes
+        self.backend.release_horizon_nodes(count=count)
+
+    def release_all_horizon(self):
+        """Release all remaining horizon nodes"""
+        if not self.backend.node_states:
+            self.log_message("No active order", "info")
+            return
+
+        # Find horizon nodes (not released)
+        horizon_nodes = [ns for ns in self.backend.node_states if not ns.released]
+
+        if not horizon_nodes:
+            self.log_message("No horizon nodes to release", "info")
+            return
+
+        count = len(horizon_nodes)
+        node_names = [ns.nodeId for ns in horizon_nodes]
+        self.log_message(f"Releasing ALL {count} horizon nodes: {' → '.join(node_names)}", "success")
+
+        # Release all
+        self.backend.release_horizon_nodes(count=count)
+
+    def release_next_horizon(self):
+        """Release single horizon node (backward compatibility)"""
+        self.horizon_release_count.set(1)
+        self.release_horizon_batch()
 
     # ========================================================================
     # MOUSE EVENTS
@@ -634,23 +712,41 @@ class DashboardApp:
         if self.backend.current_order:
             order_id = self.backend.current_order.get("orderId", 0)
             update_id = self.backend.current_order.get("orderUpdateId", 0)
-            # Handle both numeric and string order IDs
             order_display = f"#{order_id} (upd: {update_id})"
             self.vars["order"].set(order_display)
-        elif self.backend.order_id and self.backend.order_id > 0:
-            # Order completed but ID retained (Issue 2 fix)
+        elif self.backend.order_id:
+            # Order completed but ID retained
             order_display = f"#{self.backend.order_id} (done)"
             self.vars["order"].set(order_display)
         else:
             self.vars["order"].set("--")
 
-        # Update horizon status
+        # ENHANCED: Update horizon status with more detail
         if self.backend.node_states:
             base_count = sum(1 for ns in self.backend.node_states if ns.released)
             horizon_count = sum(1 for ns in self.backend.node_states if not ns.released)
-            self.horizon_status.config(text=f"Base: {base_count} nodes | Horizon: {horizon_count} nodes")
+
+            if self.backend.waiting_at_decision_point:
+                status_text = f"⏸ WAITING | Horizon: {horizon_count} nodes"
+                status_color = "#FFA000"  # Orange
+            elif horizon_count > 0:
+                status_text = f"Base: {base_count} | Horizon: {horizon_count}"
+                status_color = "#4444AA"  # Blue
+            else:
+                status_text = f"All {base_count} nodes released"
+                status_color = "#4CAF50"  # Green
+
+            self.horizon_status.config(text=status_text, fg=status_color)
+
+            # Update spinbox max to match available horizon nodes
+            if horizon_count > 0:
+                self.horizon_spinbox.config(to=horizon_count)
+                if self.horizon_release_count.get() > horizon_count:
+                    self.horizon_release_count.set(min(horizon_count, self.horizon_release_count.get()))
+            else:
+                self.horizon_spinbox.config(to=1)
         else:
-            self.horizon_status.config(text="No active order")
+            self.horizon_status.config(text="No active order", fg="#888")
 
         # Redraw canvas
         self.draw_canvas()

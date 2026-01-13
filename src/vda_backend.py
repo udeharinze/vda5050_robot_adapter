@@ -1,15 +1,19 @@
 # ============================================================================
-# vda_backend.py - VDA 5050 v2.1.0 Backend Controller
+# vda_backend_refactored.py - VDA 5050 v2.1.0 Backend Controller (REFACTORED)
 # ============================================================================
 #
-# Features:
-#   - VDA5050 orders with Base/Horizon support
-#   - Node and Edge actions (beep, locate, etc.)
-#   - Action state tracking (WAITING → RUNNING → FINISHED/FAILED)
-#   - Pause/Resume via Valetudo API
-#   - Stop cancels current order
-#   - Connection topic (ONLINE/OFFLINE)
-#   - Home node uses dock command
+# FIXES IMPLEMENTED:
+#   1. Proper order update stitching (preserves sequenceIds)
+#   2. No homing when already at home
+#   3. Correct new order vs order update detection
+#   4. Full cancelOrder instant action implementation
+#   5. Batch horizon release support
+#
+# VDA 5050 v2.1.0 COMPLIANCE:
+#   - Orders: Proper stitching with preserved sequenceIds
+#   - Order Updates: Append-only, no state reset
+#   - cancelOrder: Full state management per spec
+#   - newBaseRequest: Correct timing
 #
 # ============================================================================
 
@@ -19,7 +23,8 @@ import math
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
+from enum import Enum
 import paho.mqtt.client as mqtt
 from vda_config import (
     MQTT_BROKER, MQTT_PORT, MANUFACTURER, SERIAL_NUMBER, VDA_VERSION, MAP_ID,
@@ -34,9 +39,10 @@ from vda_config import (
 COMMAND_COOLDOWN_SEC = NAV.COMMAND_COOLDOWN_SEC
 STALLED_TIMEOUT_SEC = NAV.STALL_TIMEOUT_SEC
 ARRIVAL_TOLERANCE_MM = NAV.POSITION_TOLERANCE_MM
-STATE_PUBLISH_INTERVAL = 1.0  # Publish state every second
-CONNECTION_PUBLISH_INTERVAL = 1.0  # Publish connection every second
-ACTION_TIMEOUT_SEC = 10.0  # Timeout for actions like beep/locate
+STATE_PUBLISH_INTERVAL = 1.0
+CONNECTION_PUBLISH_INTERVAL = 1.0
+ACTION_TIMEOUT_SEC = 10.0
+MAX_START_DISTANCE_MM = 500  # Maximum distance to accept a new order start node
 
 # ============================================================================
 # MQTT TOPICS (VDA 5050 Standard)
@@ -47,6 +53,22 @@ TOPIC_STATE = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/state"
 TOPIC_INSTANT_ACTIONS = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/instantActions"
 TOPIC_CONNECTION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/connection"
 TOPIC_VISUALIZATION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/visualization"
+
+
+# ============================================================================
+# ENUMS
+# ============================================================================
+
+class OrderRejectionReason(Enum):
+    """VDA 5050 order rejection reasons"""
+    NONE = "none"
+    VEHICLE_BUSY = "vehicleAlreadyExecutingOrder"
+    START_NODE_TOO_FAR = "startNodeTooFarFromCurrentPosition"
+    DEPRECATED_UPDATE = "deprecatedOrderUpdateId"
+    ORDER_ID_MISMATCH = "orderIdMismatch"
+    INVALID_CONTINUATION = "invalidContinuation"
+    INVALID_STITCHING = "invalidStitching"
+    MISSING_NODE_POSITION = "missingNodePosition"
 
 
 # ============================================================================
@@ -138,18 +160,27 @@ class RobotBackend:
         self.is_driving = False
         self.paused = False
 
-        # VDA5050 Order State
+        # ====================================================================
+        # VDA5050 Order State - CRITICAL FOR STITCHING
+        # ====================================================================
         self.current_order: Optional[Dict] = None
-        self.order_id = 0  # Numeric order ID (increments with each new order)
-        self.order_update_id = 0
-        self._order_id_counter = 0  # Counter for generating unique order IDs (never decreases)
-        self.last_node_id = None  # Will be set on first command based on actual position
-        self.last_node_sequence_id = 0
+        self.order_id: str = ""  # String order ID (VDA 5050 uses strings)
+        self.order_update_id: int = 0
+        self._order_id_counter: int = 0  # Counter for generating unique order IDs
+
+        # CRITICAL: Track last node state for stitching validation
+        self.last_node_id: Optional[str] = None
+        self.last_node_sequence_id: int = 0
+
+        # CRITICAL: Global sequence counter - NEVER reset during order updates
+        self._global_sequence_id: int = 0
 
         # Node/Edge states
         self.node_states: List[NodeState] = []
         self.edge_states: List[EdgeState] = []
-        self.traversed_node_indices: int = 0
+
+        # CRITICAL: Track traversed nodes by sequenceId (not by index!)
+        self._traversed_sequence_ids: set = set()
 
         # Action states - track all actions from current order
         self.action_states: List[ActionState] = []
@@ -158,15 +189,16 @@ class RobotBackend:
 
         # Mission control
         self.mission_active = False
-        self.mission_queue: List[str] = []
+        self.mission_queue: List[Tuple[str, int]] = []  # List of (nodeId, sequenceId) tuples
         self.current_target_node: Optional[str] = None
+        self.current_target_sequence_id: Optional[int] = None
         self.waiting_at_decision_point = False
-        self.new_base_request = False  # True when APPROACHING decision point
+        self.new_base_request = False
         self.last_command_ts = 0.0
         self.last_state_publish_ts = 0.0
-        self.last_connection_publish_ts = 0.0  # Track connection topic publishing
+        self.last_connection_publish_ts = 0.0
 
-        # Pending actions for current node (execute after arrival)
+        # Pending actions for current node
         self.pending_node_actions: List[Dict] = []
 
         # GUI state
@@ -175,13 +207,16 @@ class RobotBackend:
         # Header counter
         self._header_id = 0
 
+        # Action ID counters for simpler IDs (dock1, dock2, stop1, etc.)
+        self._action_id_counters: Dict[str, int] = {}
+
         # Threading
         self.lock = threading.RLock()
 
         # Error tracking
         self.errors: List[Dict] = []
 
-        # Initial position sync flag - to detect robot's actual position on startup
+        # Initial position sync flag
         self._initial_position_synced = False
 
     # ========================================================================
@@ -190,7 +225,6 @@ class RobotBackend:
 
     def start(self):
         """Start MQTT client and main loop"""
-        # Determine MQTT protocol version
         if MQTT_VERSION == "3.1":
             protocol = mqtt.MQTTv31
             self.log("📋 Using MQTT protocol v3.1", "info")
@@ -201,7 +235,6 @@ class RobotBackend:
             protocol = mqtt.MQTTv5
             self.log("📋 Using MQTT protocol v5.0", "info")
 
-        # Create MQTT client - use WebSocket transport if configured
         if MQTT_WEBSOCKET:
             self.client = mqtt.Client(
                 mqtt.CallbackAPIVersion.VERSION2,
@@ -221,7 +254,7 @@ class RobotBackend:
         self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
 
-        # Set last will for connection topic (OFFLINE when disconnected unexpectedly)
+        # Set last will
         last_will = {
             "headerId": 0,
             "timestamp": self._get_timestamp(),
@@ -232,22 +265,18 @@ class RobotBackend:
         }
         self.client.will_set(TOPIC_CONNECTION, json.dumps(last_will), qos=1, retain=True)
 
-        # === AUTHENTICATION ===
         if MQTT_USERNAME and MQTT_PASSWORD:
             self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
             self.log(f"🔐 MQTT auth enabled for user: {MQTT_USERNAME}", "info")
 
-        # === TLS/SSL ENCRYPTION ===
         if MQTT_WEBSOCKET:
             import ssl
-            # Create SSL context that doesn't verify certificates (for development)
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
             self.client.tls_set_context(ssl_context)
             self.log("🔒 TLS encryption enabled", "info")
 
-        # === WEBSOCKET PATH ===
         if MQTT_WEBSOCKET and MQTT_WS_PATH:
             self.client.ws_set_options(path=MQTT_WS_PATH)
             self.log(f"🌐 WebSocket path: {MQTT_WS_PATH}", "info")
@@ -265,7 +294,7 @@ class RobotBackend:
             self.log(f"✗ MQTT connection failed: {e}", "error")
 
     def connect(self):
-        """Alias for start() - for GUI compatibility"""
+        """Alias for start()"""
         self.start()
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
@@ -276,15 +305,10 @@ class RobotBackend:
                 self.log("✓ MQTT connected", "success")
                 self.log(f"📡 Order topic: {TOPIC_ORDER}", "info")
                 self.log(f"📡 State topic: {TOPIC_STATE}", "info")
-                self.log(f"📡 Connection topic: {TOPIC_CONNECTION}", "info")
-                self.log(f"📡 Instant Actions topic: {TOPIC_INSTANT_ACTIONS}", "info")
 
-                # Subscribe to topics
             client.subscribe(TOPIC_ORDER)
             client.subscribe(TOPIC_VISUALIZATION)
             client.subscribe(TOPIC_INSTANT_ACTIONS)
-
-            # Publish ONLINE connection state (with logging)
             self._publish_connection_state("ONLINE", log=True)
         else:
             self._connected = False
@@ -317,7 +341,7 @@ class RobotBackend:
     # ========================================================================
 
     def _publish_connection_state(self, state: str, log: bool = False):
-        """Publish connection state (ONLINE, OFFLINE, CONNECTIONBROKEN)"""
+        """Publish connection state"""
         if not self.client:
             return
 
@@ -334,11 +358,11 @@ class RobotBackend:
             self.log(f"📡 Connection: {state}", "info")
 
     # ========================================================================
-    # VISUALIZATION HANDLING (Robot Position from Bridge)
+    # VISUALIZATION HANDLING
     # ========================================================================
 
     def _handle_visualization(self, payload: Dict):
-        """Update internal state from visualization topic (sent by bridge)"""
+        """Update internal state from visualization topic"""
         pos = payload.get("agvPosition", {})
         if pos:
             new_x = pos.get("x")
@@ -354,7 +378,6 @@ class RobotBackend:
                 if new_theta is not None:
                     self.pose["theta"] = new_theta
 
-                # Mark that we've received at least one position update
                 self._initial_position_synced = True
 
         self.is_driving = payload.get("driving", False)
@@ -386,14 +409,13 @@ class RobotBackend:
         self.display_pose["theta"] = self.pose["theta"]
 
     # ========================================================================
-    # INITIAL POSITION SYNC & PATH FINDING
+    # POSITION SYNC & PATH FINDING
     # ========================================================================
 
     def _sync_initial_position(self):
         """Sync last_node_id with robot's actual position on startup"""
         nearest = self._find_nearest_node()
         if nearest:
-            # Check if actually at this node (within tolerance)
             node_data = NODES.get(nearest)
             if node_data:
                 dist = math.sqrt(
@@ -409,7 +431,7 @@ class RobotBackend:
         self._initial_position_synced = True
 
     def _find_nearest_node(self) -> Optional[str]:
-        """Find the nearest defined node to robot's current position"""
+        """Find the nearest defined node"""
         if not self.pose:
             return None
 
@@ -431,11 +453,7 @@ class RobotBackend:
         return nearest_node
 
     def _find_path(self, start_node: str, end_node: str) -> List[str]:
-        """
-        Find a valid path from start_node to end_node using BFS.
-        Uses the EDGES configuration to determine valid connections.
-        Returns list of node IDs representing the path, or empty list if no path exists.
-        """
+        """Find path using BFS (Dijkstra without weights)"""
         if start_node == end_node:
             return [start_node]
 
@@ -443,16 +461,14 @@ class RobotBackend:
             self.log(f"✗ Invalid nodes: {start_node} or {end_node}", "error")
             return []
 
-        # Build adjacency list from EDGES (bidirectional)
         adjacency = {node: [] for node in NODES}
         for edge in EDGES:
             start = edge.get("start")
             end = edge.get("end")
             if start and end:
                 adjacency[start].append(end)
-                adjacency[end].append(start)  # Bidirectional
+                adjacency[end].append(start)
 
-        # BFS to find shortest path
         queue = deque([(start_node, [start_node])])
         visited = {start_node}
 
@@ -470,131 +486,221 @@ class RobotBackend:
         self.log(f"✗ No path found from {start_node} to {end_node}", "error")
         return []
 
-    def send_goto_node(self, target_node: str):
-        """
-        Navigate to a target node using valid edges.
-        Called when user clicks on a node in the GUI.
-        """
-        with self.lock:
-            # Determine starting node
-            start_node = self.last_node_id
-
-            # If we don't have a last_node_id, find nearest node
-            if not start_node:
-                start_node = self._find_nearest_node()
-                if start_node:
-                    self.log(f"📍 Starting from nearest node: {start_node}", "info")
-                    self.last_node_id = start_node
-                else:
-                    self.log("✗ Cannot determine starting position", "error")
-                    return
-
-            # If already at target
-            if start_node == target_node:
-                self.log(f"Already at {target_node}", "info")
-                return
-
-            # Find path using edges
-            path = self._find_path(start_node, target_node)
-
-            if not path:
-                self.log(f"✗ No valid path from {start_node} to {target_node}", "error")
-                return
-
-            self.log(f"📍 Path: {' → '.join(path)}", "info")
-
-            # Use the existing mission sequence logic
-            self.set_mission_sequence(path)
-
-    def send_mission(self, path: List[str]):
-        """
-        Start a mission with the given path.
-        Called by GUI for predefined missions.
-        """
-        if not path:
-            self.log("✗ Empty path provided", "error")
-            return
-
-        # If we don't know current position, find it first
-        if not self.last_node_id:
-            nearest = self._find_nearest_node()
-            if nearest:
-                self.last_node_id = nearest
-                self.log(f"📍 Current position: {nearest}", "info")
-            else:
-                self.log("✗ Cannot determine starting position", "error")
-                return
-
-        # Check if robot is at the start of the mission
-        if self.last_node_id != path[0]:
-            # Robot is not at the start of the mission
-            # Find path from current location to mission start
-            prefix_path = self._find_path(self.last_node_id, path[0])
-            if prefix_path and len(prefix_path) > 1:
-                # Combine: prefix (without last element, since it's path[0]) + mission path
-                full_path = prefix_path[:-1] + path
-                self.log(f"📍 Extended path: {' → '.join(full_path)}", "info")
-                self.set_mission_sequence(full_path)
-            else:
-                # No valid path or already at start, use mission as-is
-                self.set_mission_sequence(path)
-        else:
-            self.set_mission_sequence(path)
-
     # ========================================================================
-    # VDA5050 ORDER HANDLING
+    # VDA5050 ORDER HANDLING - REFACTORED
     # ========================================================================
 
     def _handle_order(self, order: Dict):
-        """Handle incoming VDA5050 order"""
-        incoming_order_id = order.get("orderId", 0)
+        """
+        Handle incoming VDA5050 order with proper new order vs update detection.
+
+        VDA 5050 v2.1.0 Order Acceptance Logic:
+        1. Validate JSON
+        2. Determine: New order or Order update
+        3. Apply appropriate handling
+        """
+        incoming_order_id = str(order.get("orderId", ""))
         incoming_update_id = order.get("orderUpdateId", 0)
 
         with self.lock:
-            # Same order ID - check if it's an update or echo
-            if incoming_order_id == self.order_id:
-                if incoming_update_id < self.order_update_id:
-                    # Strictly older update - ignore with warning
-                    self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
-                    self.log(f"   ⚠ Old update ignored (current: {self.order_update_id})", "warning")
-                    return
-                elif incoming_update_id == self.order_update_id:
-                    # Same update ID - this is our own message echoing back, silently ignore
-                    return
-                else:
-                    # Newer update ID - process the update
-                    self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
-                    self.log(f"   📝 ORDER UPDATE", "info")
-                    self._process_order_update(order)
-            else:
-                # Different order ID - new order
+            # Determine order type
+            is_echo = (incoming_order_id == self.order_id and
+                       incoming_update_id == self.order_update_id)
+
+            if is_echo:
+                # This is our own message echoing back - silently ignore
+                return
+
+            is_new_order = (incoming_order_id != self.order_id)
+            is_update = (incoming_order_id == self.order_id and
+                         incoming_update_id > self.order_update_id)
+            is_deprecated = (incoming_order_id == self.order_id and
+                             incoming_update_id < self.order_update_id)
+
+            if is_deprecated:
                 self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
-                if self.mission_active:
-                    self.log(f"   ⏹ Cancelling previous order", "warning")
+                self.log(f"   ⚠ Deprecated update ignored (current: {self.order_update_id})", "warning")
+                self._add_order_rejection_error(OrderRejectionReason.DEPRECATED_UPDATE)
+                return
+
+            if is_new_order:
+                self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
+                self.log(f"   🆕 NEW ORDER", "info")
+                rejection = self._validate_new_order(order)
+                if rejection != OrderRejectionReason.NONE:
+                    self.log(f"   ✗ Rejected: {rejection.value}", "error")
+                    self._add_order_rejection_error(rejection)
+                    return
                 self._process_new_order(order)
 
+            elif is_update:
+                self.log(f"📥 ORDER: #{incoming_order_id} (update: {incoming_update_id})", "info")
+                self.log(f"   📝 ORDER UPDATE ({self.order_update_id} → {incoming_update_id})", "info")
+                rejection = self._validate_order_update(order)
+                if rejection != OrderRejectionReason.NONE:
+                    self.log(f"   ✗ Rejected: {rejection.value}", "error")
+                    self._add_order_rejection_error(rejection)
+                    return
+                self._process_order_update(order)
+
+    def _validate_new_order(self, order: Dict) -> OrderRejectionReason:
+        """
+        Validate new order per VDA 5050 rules (Figure 8 flowchart).
+
+        (3) Is vehicle still executing an order or waiting for an update?
+            - We allow overriding for flexibility, but log a warning
+        (4) Is start of new order close enough to current position?
+            - Reject if too far
+        """
+        nodes = order.get("nodes", [])
+        if not nodes:
+            return OrderRejectionReason.MISSING_NODE_POSITION
+
+        # (3) Check if vehicle is busy - we allow override but log it
+        if self.mission_active or self.waiting_at_decision_point:
+            self.log(f"   ⚠ Vehicle is busy - overriding current order", "warning")
+            # Per strict VDA 5050, this should reject. But we allow override for flexibility.
+            # To strictly comply, uncomment the next line:
+            # return OrderRejectionReason.VEHICLE_BUSY
+
+        # Get first node position
+        first_node = nodes[0]
+        first_pos = first_node.get("nodePosition", {})
+
+        if not first_pos or first_pos.get("x") is None:
+            # Try to get from config
+            node_id = first_node.get("nodeId", "")
+            if node_id in NODES:
+                first_pos = {"x": NODES[node_id]["x"], "y": NODES[node_id]["y"]}
+            else:
+                return OrderRejectionReason.MISSING_NODE_POSITION
+
+        # (4) Check distance to start node
+        dist = math.sqrt(
+            (self.pose["x"] - first_pos["x"]) ** 2 +
+            (self.pose["y"] - first_pos["y"]) ** 2
+        )
+
+        if dist > MAX_START_DISTANCE_MM:
+            self.log(f"   Start node too far: {dist:.0f}mm > {MAX_START_DISTANCE_MM}mm", "warning")
+            return OrderRejectionReason.START_NODE_TOO_FAR
+
+        return OrderRejectionReason.NONE
+
+    def _validate_order_update(self, order: Dict) -> OrderRejectionReason:
+        """
+        Validate order update per VDA 5050 stitching rules (Figure 8).
+
+        VDA 5050 STITCHING RULE:
+        "The last node of the previous base is the first base node in the updated order.
+         The other nodes and edges from the previous base are NOT RESENT."
+
+        Flowchart steps:
+        (3) Is vehicle executing or waiting?
+            - YES: (7) Is valid continuation of running order?
+            - NO:  (8) Is valid continuation of completed order?
+
+        This means:
+        - Update message contains: [stitch_node, new_nodes...]
+        - Stitch node = last base node from previous order
+        - Already traversed nodes are NOT in the update
+        """
+        if order.get("orderId") != self.order_id:
+            return OrderRejectionReason.ORDER_ID_MISMATCH
+
+        # Get first node in update (stitch point)
+        update_nodes = order.get("nodes", [])
+        if not update_nodes:
+            return OrderRejectionReason.INVALID_CONTINUATION
+
+        first_node_in_update = update_nodes[0]
+        stitch_node_id = first_node_in_update.get("nodeId")
+        stitch_seq_id = first_node_in_update.get("sequenceId")
+
+        # (3) Is vehicle executing or waiting for update?
+        vehicle_executing = self.mission_active or self.waiting_at_decision_point or self.node_states
+
+        if vehicle_executing:
+            # (7) Validate as continuation of RUNNING order
+            # Find last released (base) node in our current state
+            last_base_node = None
+            for ns in self.node_states:
+                if ns.released:
+                    last_base_node = ns
+
+            if not last_base_node:
+                self.log(f"   No base nodes in running order", "error")
+                return OrderRejectionReason.INVALID_CONTINUATION
+
+            # Stitch validation: first node in update must match our last base node
+            if last_base_node.nodeId != stitch_node_id:
+                self.log(f"   Stitch fail: nodeId mismatch (running)", "error")
+                self.log(f"      Our last base: {last_base_node.nodeId} (seq:{last_base_node.sequenceId})", "error")
+                self.log(f"      Update first:  {stitch_node_id} (seq:{stitch_seq_id})", "error")
+                return OrderRejectionReason.INVALID_STITCHING
+
+            if last_base_node.sequenceId != stitch_seq_id:
+                self.log(f"   Stitch fail: sequenceId mismatch (running)", "error")
+                self.log(f"      Our last base seq: {last_base_node.sequenceId}", "error")
+                self.log(f"      Update first seq:  {stitch_seq_id}", "error")
+                return OrderRejectionReason.INVALID_STITCHING
+
+            self.log(f"   ✓ Stitch valid (running): {last_base_node.nodeId} (seq:{last_base_node.sequenceId})",
+                     "success")
+        else:
+            # (8) Validate as continuation of COMPLETED order
+            # The stitch point should be the last node we visited (last_node_id, last_node_sequence_id)
+            if not self.last_node_id or self.last_node_sequence_id is None:
+                self.log(f"   No last node for completed order continuation", "error")
+                return OrderRejectionReason.INVALID_CONTINUATION
+
+            if self.last_node_id != stitch_node_id:
+                self.log(f"   Stitch fail: nodeId mismatch (completed)", "error")
+                self.log(f"      Our last node: {self.last_node_id} (seq:{self.last_node_sequence_id})", "error")
+                self.log(f"      Update first:  {stitch_node_id} (seq:{stitch_seq_id})", "error")
+                return OrderRejectionReason.INVALID_STITCHING
+
+            if self.last_node_sequence_id != stitch_seq_id:
+                self.log(f"   Stitch fail: sequenceId mismatch (completed)", "error")
+                self.log(f"      Our last node seq: {self.last_node_sequence_id}", "error")
+                self.log(f"      Update first seq:  {stitch_seq_id}", "error")
+                return OrderRejectionReason.INVALID_STITCHING
+
+            self.log(f"   ✓ Stitch valid (completed): {self.last_node_id} (seq:{self.last_node_sequence_id})",
+                     "success")
+
+        return OrderRejectionReason.NONE
+
     def _process_new_order(self, order: Dict):
-        """Process a new VDA5050 order (from Flexus or external master control)"""
-        incoming_order_id = order.get("orderId", 0)
-        self.order_id = incoming_order_id
+        """
+        Process a new VDA5050 order.
+
+        VDA 5050 rules for new orders:
+        - Delete all previous nodeStates and edgeStates
+        - Reset action states
+        - Start fresh execution
+        """
+        self.order_id = str(order.get("orderId", ""))
         self.order_update_id = order.get("orderUpdateId", 0)
         self.current_order = order
 
-        # If Flexus sends a numeric orderId, update our counter to avoid conflicts
-        # This ensures GUI orders will always have higher IDs than Flexus orders
-        if isinstance(incoming_order_id, int) and incoming_order_id >= self._order_id_counter:
-            self._order_id_counter = incoming_order_id
+        # Update counter to avoid GUI conflicts
+        if self.order_id.isdigit():
+            order_num = int(self.order_id)
+            if order_num >= self._order_id_counter:
+                self._order_id_counter = order_num
 
         self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
 
+        # CLEAR ALL PREVIOUS STATE
         self._reset_gui_colors()
-        self.action_states = []  # Clear action states
-
-        # Parse nodes with their actions
+        self.action_states = []
         self.node_states = []
+        self.edge_states = []
         self.mission_queue = []
-        self.traversed_node_indices = 0
+        self._traversed_sequence_ids = set()
 
+        # Parse nodes
         nodes = order.get("nodes", [])
         for node_data in nodes:
             node_actions = node_data.get("actions", [])
@@ -608,7 +714,7 @@ class RobotBackend:
             )
             self.node_states.append(ns)
 
-            # Register actions in action_states
+            # Register actions
             for action in node_actions:
                 action_state = ActionState(
                     actionId=action.get("actionId", f"action_{len(self.action_states)}"),
@@ -619,16 +725,9 @@ class RobotBackend:
                 self.action_states.append(action_state)
 
             status = "✓ BASE" if ns.released else "○ HORIZON"
-            actions_str = f" [{len(node_actions)} actions]" if node_actions else ""
-            self.log(f"   [{ns.sequenceId}] {ns.nodeId}: {status}{actions_str}", "info")
+            self.log(f"   [{ns.sequenceId}] {ns.nodeId}: {status}", "info")
 
-            if ns.released:
-                self.mission_queue.append(ns.nodeId)
-                if ns.nodeId in self.gui_node_states:
-                    self.gui_node_states[ns.nodeId] = "planned"
-
-        # Parse edges with their actions
-        self.edge_states = []
+        # Parse edges
         for edge_data in order.get("edges", []):
             edge_actions = edge_data.get("actions", [])
 
@@ -642,21 +741,16 @@ class RobotBackend:
             )
             self.edge_states.append(es)
 
-            # Register edge actions
             for action in edge_actions:
                 action_state = ActionState(
                     actionId=action.get("actionId", f"action_{len(self.action_states)}"),
                     actionType=action.get("actionType", "unknown"),
-                    actionStatus="WAITING",
-                    actionDescription=action.get("actionDescription", "")
+                    actionStatus="WAITING"
                 )
                 self.action_states.append(action_state)
 
-        # Decision point
-        decision_point = self._find_decision_point()
-        has_horizon = any(not ns.released for ns in self.node_states)
-        if decision_point and has_horizon:
-            self.log(f"   🎯 Decision point: {decision_point}", "info")
+        # Build mission queue from RELEASED nodes only
+        self._build_mission_queue()
 
         # Start mission
         self.mission_active = True
@@ -665,96 +759,550 @@ class RobotBackend:
         self.current_target_node = None
         self.pending_node_actions = []
 
-        # Skip first node if already there
-        if self.mission_queue and self._is_at_node(self.mission_queue[0]):
-            first = self.mission_queue.pop(0)
-            self.log(f"   Already at {first}, skipping", "info")
-            self.gui_node_states[first] = "done"
-            self.last_node_id = first
-            self.traversed_node_indices = 1
+        # FIX: Check if already at first node BEFORE adding to queue
+        if self.mission_queue:
+            first_node_id, first_seq_id = self.mission_queue[0]
+            if self._is_at_node(first_node_id):
+                self.log(f"   Already at {first_node_id}, marking as traversed", "info")
+                self._mark_node_traversed(first_node_id, first_seq_id)
+                self.mission_queue.pop(0)
 
-            # Execute actions for this node
-            for ns in self.node_states:
-                if ns.nodeId == first and ns.actions:
-                    self._execute_node_actions(ns.actions)
+                # Execute actions for this node
+                for ns in self.node_states:
+                    if ns.nodeId == first_node_id and ns.sequenceId == first_seq_id and ns.actions:
+                        self._execute_node_actions(ns.actions)
 
+        # Publish order and advance
+        self._publish_current_order(is_update=False)
         self._advance_mission()
 
     def _process_order_update(self, order: Dict):
-        """Process order update"""
+        """
+        Process order update with proper VDA 5050 stitching.
+
+        VDA 5050 SPEC:
+        "The last node of the previous base is the first base node in the updated order.
+         The other nodes and edges from the previous base are NOT RESENT."
+
+        This means:
+        - Update contains: [stitch_node, following_nodes...]
+        - Already traversed nodes are NOT in the update message
+        - We must MERGE the update with our existing state
+
+        Example:
+          Original: A(0) → B(2) → C(4) [base] | D(6) → E(8) [horizon]
+          Robot at B, approaching C (decision point)
+          Update received: C(4) → D(6) → E(8) → F(10)
+          Result: Keep A,B as traversed, update C onwards
+        """
         self.order_update_id = order.get("orderUpdateId", 0)
         self.current_order = order
 
-        # Update node_states
-        new_node_states = []
-        for node_data in order.get("nodes", []):
-            node_actions = node_data.get("actions", [])
-            ns = NodeState(
-                nodeId=node_data.get("nodeId", ""),
-                sequenceId=node_data.get("sequenceId", 0),
-                released=node_data.get("released", True),
-                nodePosition=node_data.get("nodePosition"),
-                actions=node_actions
-            )
-            new_node_states.append(ns)
+        update_nodes = order.get("nodes", [])
+        update_edges = order.get("edges", [])
 
-            if ns.released and ns.nodeId not in self.mission_queue:
-                if not self._is_at_node(ns.nodeId):
-                    self.mission_queue.append(ns.nodeId)
-                    if ns.nodeId in self.gui_node_states:
-                        self.gui_node_states[ns.nodeId] = "planned"
-                    self.log(f"   Released: {ns.nodeId}", "info")
+        if not update_nodes:
+            self.log("   ⚠ Empty update, ignoring", "warning")
+            return
 
-        self.node_states = new_node_states
+        # Find the stitch point in our current state
+        # Stitch node = first node in update = last base node in our state
+        stitch_node_data = update_nodes[0]
+        stitch_seq_id = stitch_node_data.get("sequenceId", 0)
+        stitch_node_id = stitch_node_data.get("nodeId", "")
 
-        # Update edge_states
-        self.edge_states = []
-        for edge_data in order.get("edges", []):
-            edge_actions = edge_data.get("actions", [])
-            es = EdgeState(
-                edgeId=edge_data.get("edgeId", ""),
-                sequenceId=edge_data.get("sequenceId", 0),
-                released=edge_data.get("released", True),
-                startNodeId=edge_data.get("startNodeId", ""),
-                endNodeId=edge_data.get("endNodeId", ""),
-                actions=edge_actions
-            )
-            self.edge_states.append(es)
+        self.log(f"   Stitch point: {stitch_node_id} (seq:{stitch_seq_id})", "info")
 
+        # Keep all nodes with sequenceId < stitch_seq_id (already traversed/traversing)
+        # These are NOT in the update message per VDA 5050 spec
+        preserved_nodes = [ns for ns in self.node_states if ns.sequenceId < stitch_seq_id]
+        preserved_edges = [es for es in self.edge_states if es.sequenceId < stitch_seq_id]
+
+        self.log(f"   Preserved {len(preserved_nodes)} traversed nodes", "info")
+
+        # Process nodes from the update (stitch point onwards)
+        new_nodes = []
+        for node_data in update_nodes:
+            seq_id = node_data.get("sequenceId", 0)
+            node_id = node_data.get("nodeId", "")
+            is_released = node_data.get("released", True)
+
+            # Check if this node already exists in our preserved state
+            # (It shouldn't, since preserved nodes have seq < stitch_seq)
+            existing = next((ns for ns in preserved_nodes if ns.sequenceId == seq_id), None)
+            if existing:
+                # Update released flag if changed
+                if not existing.released and is_released:
+                    existing.released = True
+                    self.log(f"   ✓ Released (existing): {node_id} (seq:{seq_id})", "success")
+                continue
+
+            # Check if this node exists in our current state (at or after stitch)
+            current_node = next((ns for ns in self.node_states if ns.sequenceId == seq_id), None)
+
+            if current_node:
+                # Node exists - update its released flag
+                was_released = current_node.released
+                current_node.released = is_released
+
+                if not was_released and is_released:
+                    self.log(f"   ✓ Released: {node_id} (seq:{seq_id})", "success")
+                    # Add to mission queue if not already traversed
+                    if seq_id not in self._traversed_sequence_ids:
+                        if not any(nid == node_id and sid == seq_id for nid, sid in self.mission_queue):
+                            self.mission_queue.append((node_id, seq_id))
+                            if node_id in self.gui_node_states:
+                                self.gui_node_states[node_id] = "planned"
+
+                new_nodes.append(current_node)
+            else:
+                # Completely new node from update
+                ns = NodeState(
+                    nodeId=node_id,
+                    sequenceId=seq_id,
+                    released=is_released,
+                    nodePosition=node_data.get("nodePosition"),
+                    actions=node_data.get("actions", [])
+                )
+                new_nodes.append(ns)
+
+                if is_released and seq_id not in self._traversed_sequence_ids:
+                    self.mission_queue.append((node_id, seq_id))
+                    if node_id in self.gui_node_states:
+                        self.gui_node_states[node_id] = "planned"
+                    self.log(f"   + New node: {node_id} (seq:{seq_id}) {'[BASE]' if is_released else '[HORIZON]'}",
+                             "info")
+                elif not is_released:
+                    self.log(f"   + New node: {node_id} (seq:{seq_id}) [HORIZON]", "info")
+
+        # Merge: preserved (traversed) + new (from update)
+        self.node_states = preserved_nodes + new_nodes
+
+        # Similarly handle edges
+        new_edges = []
+        for edge_data in update_edges:
+            seq_id = edge_data.get("sequenceId", 0)
+
+            # Skip if already in preserved edges
+            if any(es.sequenceId == seq_id for es in preserved_edges):
+                continue
+
+            # Check if exists in current state
+            current_edge = next((es for es in self.edge_states if es.sequenceId == seq_id), None)
+
+            if current_edge:
+                was_released = current_edge.released
+                current_edge.released = edge_data.get("released", True)
+                if not was_released and current_edge.released:
+                    self.log(f"   ✓ Released edge: {current_edge.edgeId}", "info")
+                new_edges.append(current_edge)
+            else:
+                es = EdgeState(
+                    edgeId=edge_data.get("edgeId", ""),
+                    sequenceId=seq_id,
+                    released=edge_data.get("released", True),
+                    startNodeId=edge_data.get("startNodeId", ""),
+                    endNodeId=edge_data.get("endNodeId", ""),
+                    actions=edge_data.get("actions", [])
+                )
+                new_edges.append(es)
+
+        self.edge_states = preserved_edges + new_edges
+
+        # Sort by sequenceId
+        self.node_states.sort(key=lambda ns: ns.sequenceId)
+        self.edge_states.sort(key=lambda es: es.sequenceId)
+        self.mission_queue.sort(key=lambda x: x[1])
+
+        # Log final state
+        base_count = sum(1 for ns in self.node_states if ns.released)
+        horizon_count = sum(1 for ns in self.node_states if not ns.released)
+        self.log(f"   State: {len(self.node_states)} nodes ({base_count} base, {horizon_count} horizon)", "info")
+
+        # Resume if waiting at decision point
         if self.waiting_at_decision_point:
             self.log(f"   ▶ Resuming from decision point", "success")
             self.waiting_at_decision_point = False
             self.new_base_request = False
             self._advance_mission()
         elif self.new_base_request:
-            # Order update received while approaching decision point - good!
             self.log(f"   ✓ Base extended before reaching decision point", "success")
             self.new_base_request = False
 
-    def _find_decision_point(self) -> Optional[str]:
-        """Find last released node"""
-        decision_point = None
+        # Publish updated order
+        self._publish_current_order(is_update=True)
+
+    def _build_mission_queue(self):
+        """Build mission queue from released nodes, excluding traversed ones."""
+        self.mission_queue = []
         for ns in self.node_states:
-            if ns.released:
-                decision_point = ns.nodeId
+            if ns.released and ns.sequenceId not in self._traversed_sequence_ids:
+                self.mission_queue.append((ns.nodeId, ns.sequenceId))
+                if ns.nodeId in self.gui_node_states:
+                    self.gui_node_states[ns.nodeId] = "planned"
+
+    def _mark_node_traversed(self, node_id: str, sequence_id: int):
+        """Mark a node as traversed."""
+        self._traversed_sequence_ids.add(sequence_id)
+        self.last_node_id = node_id
+        self.last_node_sequence_id = sequence_id
+        if node_id in self.gui_node_states:
+            self.gui_node_states[node_id] = "done"
+
+    def _add_order_rejection_error(self, reason: OrderRejectionReason):
+        """Add order rejection error to state."""
+        # Determine correct error type per VDA 5050
+        if reason == OrderRejectionReason.DEPRECATED_UPDATE:
+            error_type = "orderUpdateError"  # 6.6.4.3
+        elif reason in [OrderRejectionReason.MISSING_NODE_POSITION]:
+            error_type = "validationError"  # 6.6.4.1
+        else:
+            error_type = "orderError"
+
+        self.add_error(
+            error_type=error_type,
+            error_level="WARNING",
+            error_description=f"Order rejected: {reason.value}"
+        )
+
+    # ========================================================================
+    # NAVIGATION
+    # ========================================================================
+
+    def _advance_mission(self):
+        """Advance to next node in mission queue."""
+        with self.lock:
+            if self.paused:
+                return
+
+            if not self.mission_queue:
+                has_horizon = any(not ns.released for ns in self.node_states)
+                if has_horizon:
+                    self.log(f"⏸ Waiting at decision point", "warning")
+                    self.waiting_at_decision_point = True
+                    self.new_base_request = False
+                    self.current_target_node = None
+                else:
+                    self._complete_mission()
+                return
+
+            next_node_id, next_seq_id = self.mission_queue.pop(0)
+            self.current_target_node = next_node_id
+            self.current_target_sequence_id = next_seq_id
+
+            # FIX: Check if already at this node
+            if self._is_at_node(next_node_id):
+                self.log(f"✓ Already at: {next_node_id}", "success")
+                self._on_node_reached(next_node_id, next_seq_id)
+                return
+
+            # Check if approaching decision point
+            has_horizon = any(not ns.released for ns in self.node_states)
+            is_heading_to_decision_point = (len(self.mission_queue) == 0) and has_horizon
+
+            if is_heading_to_decision_point:
+                self.new_base_request = True
+                self.log(f"📡 newBaseRequest: true", "warning")
             else:
-                break
-        return decision_point
+                self.new_base_request = False
+
+            # Get pending actions for this node
+            self.pending_node_actions = []
+            for ns in self.node_states:
+                if ns.nodeId == next_node_id and ns.sequenceId == next_seq_id:
+                    self.pending_node_actions = ns.actions.copy()
+                    break
+
+            if next_node_id in self.gui_node_states:
+                self.gui_node_states[next_node_id] = "planned"
+
+            self.log(f"→ Moving to: {next_node_id} (seq: {next_seq_id})", "info")
+            self._send_navigation_command(next_node_id, next_seq_id)
+
+    def _send_navigation_command(self, node_id: str, sequence_id: int):
+        """Send navigation command - publishes order for bridge to handle."""
+        self.last_command_ts = time.time()
+
+        # FIX: Only send dock command if NOT already at home
+        if node_id == "home":
+            if self._is_at_node("home"):
+                self.log(f"🏠 Already at home, skipping dock command", "info")
+                self._on_node_reached(node_id, sequence_id)
+                return
+            else:
+                self.log(f"🏠 Navigating to: home (dock command)", "info")
+                self._send_dock_command()
+        else:
+            self._send_goto(node_id)
+
+    def _send_goto(self, node_id: str):
+        """Send navigation command for bridge to execute.
+
+        NOTE: This does NOT publish the order - caller is responsible for publishing.
+        The order is published by set_mission_sequence/set_mission_with_horizon/release_horizon_nodes.
+        """
+        target = None
+
+        for ns in self.node_states:
+            if ns.nodeId == node_id and ns.nodePosition:
+                pos = ns.nodePosition
+                if pos.get("x") is not None and pos.get("y") is not None:
+                    target = {"x": pos["x"], "y": pos["y"]}
+                    break
+
+        if not target and node_id in NODES:
+            node_config = NODES[node_id]
+            target = {"x": node_config["x"], "y": node_config["y"]}
+
+        if not target:
+            self.log(f"✗ Unknown node: {node_id}", "error")
+            return
+
+        self.log(f"🎯 Navigating to: {node_id} ({int(target['x'])}, {int(target['y'])})", "info")
+        # NOTE: Order is NOT published here - it's already published by the caller
+
+    def _send_dock_command(self):
+        """Send dock command via instant actions."""
+        action_msg = {
+            "headerId": self._next_header_id(),
+            "timestamp": self._get_timestamp(),
+            "version": VDA_VERSION,
+            "manufacturer": MANUFACTURER,
+            "serialNumber": SERIAL_NUMBER,
+            "actions": [{
+                "actionType": "dock",
+                "actionId": self._next_action_id("dock"),
+                "blockingType": "HARD",
+                "actionParameters": []
+            }]
+        }
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
+
+    def _complete_mission(self):
+        """Complete mission."""
+        self.log(f"✅ ORDER COMPLETE: Order #{self.order_id}", "success")
+        self.mission_active = False
+        self.current_target_node = None
+        self.waiting_at_decision_point = False
+        self.new_base_request = False
+
+        # Clear states but KEEP orderId/orderUpdateId per VDA 5050
+        self.node_states = []
+        self.edge_states = []
+        self.action_states = []
+        self._traversed_sequence_ids = set()
+
+        self.log(f"   📋 Keeping Order #{self.order_id} until new order arrives", "info")
+        self._reset_gui_colors()
+
+    def _is_at_node(self, node_id: str) -> bool:
+        """Check if robot is at specified node."""
+        target = None
+
+        for ns in self.node_states:
+            if ns.nodeId == node_id and ns.nodePosition:
+                pos = ns.nodePosition
+                if pos.get("x") is not None and pos.get("y") is not None:
+                    target = {"x": pos["x"], "y": pos["y"]}
+                    break
+
+        if not target and node_id in NODES:
+            node_config = NODES[node_id]
+            target = {"x": node_config["x"], "y": node_config["y"]}
+
+        if not target:
+            return False
+
+        dist = math.sqrt(
+            (self.pose["x"] - target["x"]) ** 2 +
+            (self.pose["y"] - target["y"]) ** 2
+        )
+        return dist < ARRIVAL_TOLERANCE_MM
+
+    def _on_node_reached(self, node_id: str, sequence_id: int):
+        """Node reached - execute actions and advance."""
+        self.log(f"✓ ARRIVED: {node_id} (seq: {sequence_id})", "success")
+
+        self._mark_node_traversed(node_id, sequence_id)
+
+        # Remove incoming edge from edgeStates
+        incoming_edge_seq_id = sequence_id - 1
+        self.edge_states = [
+            es for es in self.edge_states
+            if es.sequenceId != incoming_edge_seq_id
+        ]
+
+        # Execute pending actions
+        if self.pending_node_actions:
+            self.log(f"   Executing {len(self.pending_node_actions)} actions...", "info")
+            self._execute_node_actions(self.pending_node_actions)
+            self.pending_node_actions = []
+
+        self._advance_mission()
+
+    # ========================================================================
+    # INSTANT ACTIONS - INCLUDING CANCEL ORDER
+    # ========================================================================
+
+    def _handle_instant_actions(self, payload: Dict):
+        """Handle instant actions from master control."""
+        actions = payload.get("actions", [])
+        for action in actions:
+            action_type = action.get("actionType", "")
+
+            # Filter out actions we send ourselves
+            if action_type in ["goTo", "dock", "quickCharge", "beep", "locate",
+                               "startCleaning", "stopCleaning", "pauseCleaning",
+                               "setFanSpeed", "stopMovement", "pauseMovement", "resumeMovement"]:
+                return
+
+            self.log(f"📥 Instant Action: {action_type}", "info")
+
+            if action_type == "stopPause" or action_type == "resumeOrder":
+                self.resume_mission()
+            elif action_type == "startPause" or action_type == "pauseOrder":
+                self.pause_mission()
+            elif action_type == "cancelOrder":
+                self._handle_cancel_order(action)
+
+    def _handle_cancel_order(self, action: Dict):
+        """
+        VDA 5050 v2.1.0 cancelOrder implementation (6.6.3).
+
+        Per spec:
+        - cancelOrder is an instantAction
+        - Vehicle stops (based on capabilities - right where it is or on next node)
+        - SCHEDULED (WAITING) actions → 'FAILED'
+        - RUNNING actions that CAN be interrupted → 'FAILED'
+        - RUNNING actions that CANNOT be interrupted → keep 'RUNNING' until done
+        - cancelOrder reports 'RUNNING' while actions are being processed
+        - cancelOrder reports 'FINISHED' when all movement stopped and actions done
+        - orderId and orderUpdateId are KEPT
+
+        6.6.3.2: If no order exists:
+        - cancelOrder = 'FAILED'
+        - Report "noOrderToCancel" error with errorLevel='WARNING'
+        """
+        action_id = action.get("actionId", self._next_action_id("cancel"))
+
+        self.log("🛑 CANCEL ORDER received", "error")
+
+        # 6.6.3.2: Check if there's an order to cancel
+        has_active_order = (self.node_states or self.mission_active or
+                            self.current_target_node or self.waiting_at_decision_point)
+
+        if not has_active_order and not self.order_id:
+            # No order to cancel
+            self.log("   ✗ No order to cancel", "error")
+
+            # Add cancelOrder as FAILED
+            cancel_action = ActionState(
+                actionId=action_id,
+                actionType="cancelOrder",
+                actionStatus="FAILED",
+                resultDescription="noOrderToCancel"
+            )
+            self.action_states.append(cancel_action)
+
+            # Report error per 6.6.3.2
+            self.add_error(
+                error_type="noOrderToCancel",
+                error_level="WARNING",
+                error_description="No order to cancel",
+                error_references=[{"referenceKey": "actionId", "referenceValue": action_id}]
+            )
+            return
+
+        # 1. Add cancelOrder to actionStates as RUNNING
+        cancel_action = ActionState(
+            actionId=action_id,
+            actionType="cancelOrder",
+            actionStatus="RUNNING",
+            actionDescription="Cancelling current order"
+        )
+        self.action_states.append(cancel_action)
+        self.log(f"   cancelOrder: RUNNING", "info")
+
+        # 2. Set all WAITING (scheduled) actions to FAILED
+        for a in self.action_states:
+            if a.actionStatus == "WAITING":
+                a.actionStatus = "FAILED"
+                a.resultDescription = "Cancelled by cancelOrder"
+                self.log(f"   Action {a.actionId} ({a.actionType}): WAITING → FAILED", "info")
+
+        # 3. Handle RUNNING actions
+        # For simplicity, we interrupt all running actions immediately
+        # A more sophisticated implementation would check if actions can be interrupted
+        running_actions = [a for a in self.action_states
+                           if a.actionStatus == "RUNNING" and a.actionType != "cancelOrder"]
+
+        for a in running_actions:
+            # Assume all our actions can be interrupted
+            a.actionStatus = "FAILED"
+            a.resultDescription = "Interrupted by cancelOrder"
+            self.log(f"   Action {a.actionId} ({a.actionType}): RUNNING → FAILED", "info")
+
+        # 4. Send stop command to bridge
+        action_msg = {
+            "headerId": self._next_header_id(),
+            "timestamp": self._get_timestamp(),
+            "version": VDA_VERSION,
+            "manufacturer": MANUFACTURER,
+            "serialNumber": SERIAL_NUMBER,
+            "actions": [{
+                "actionType": "stopMovement",
+                "actionId": self._next_action_id("stop"),
+                "blockingType": "HARD",
+                "actionParameters": []
+            }]
+        }
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
+        self.log(f"   Sent stop command", "info")
+
+        # 5. Update lastNodeId to nearest node (we stop at next node or immediately)
+        nearest = self._find_nearest_node()
+        if nearest and self._is_at_node(nearest):
+            self.last_node_id = nearest
+            for ns in self.node_states:
+                if ns.nodeId == nearest:
+                    self.last_node_sequence_id = ns.sequenceId
+                    break
+            self.log(f"   Updated lastNodeId: {self.last_node_id}", "info")
+
+        # 6. Clear nodeStates and edgeStates (delete states of previous order)
+        self.node_states = []
+        self.edge_states = []
+        self.log(f"   Cleared nodeStates and edgeStates", "info")
+
+        # Mission state cleanup
+        self.mission_active = False
+        self.paused = False
+        self.mission_queue = []
+        self.current_target_node = None
+        self.current_target_sequence_id = None
+        self.waiting_at_decision_point = False
+        self.new_base_request = False
+        self._traversed_sequence_ids = set()
+
+        # 7. actionStates are KEPT (per VDA 5050)
+        # (We don't clear self.action_states)
+
+        # 8. Set cancelOrder → FINISHED (all actions are now done)
+        cancel_action.actionStatus = "FINISHED"
+        cancel_action.resultDescription = "Order cancelled successfully"
+        self.log(f"   cancelOrder: FINISHED", "success")
+
+        # 9. orderId and orderUpdateId are KEPT (per VDA 5050)
+        self.log(f"   📋 Kept Order #{self.order_id} (updateId: {self.order_update_id}) [cancelled]", "info")
+
+        self._reset_gui_colors()
 
     # ========================================================================
     # ACTION EXECUTION
     # ========================================================================
 
     def _execute_node_actions(self, actions: List[Dict]):
-        """
-        Execute actions attached to a node.
-
-        Blocking Types:
-        - NONE: Execute in parallel (don't wait)
-        - SOFT: Execute, robot stopped but other actions can run in parallel
-        - HARD: Execute alone, wait for completion before next action
-        """
-        # Separate actions by blocking type
+        """Execute actions attached to a node."""
         none_actions = []
         soft_actions = []
         hard_actions = []
@@ -765,100 +1313,34 @@ class RobotBackend:
                 none_actions.append(action)
             elif blocking_type == "SOFT":
                 soft_actions.append(action)
-            else:  # HARD
+            else:
                 hard_actions.append(action)
 
-        # Execute NONE actions first (fire and forget, parallel with driving)
         for action in none_actions:
             self._execute_single_action(action, wait=False)
 
-        # Execute SOFT actions (can run in parallel with each other)
         for action in soft_actions:
             self._execute_single_action(action, wait=False)
 
-        # Execute HARD actions sequentially (wait for each)
         for action in hard_actions:
             self._execute_single_action(action, wait=True)
 
     def _execute_single_action(self, action: Dict, wait: bool = True):
-        """Execute a single action"""
+        """Execute a single action."""
         action_type = action.get("actionType", "")
         action_id = action.get("actionId", "")
         blocking_type = action.get("blockingType", "HARD")
-        action_params = action.get("actionParameters", [])
 
         self.log(f"🎬 Action: {action_type} [{blocking_type}]", "info")
-
-        # Update action state to RUNNING
         self._update_action_state(action_id, "RUNNING")
 
-        # Execute based on action type
-        success = False
+        success = True
+        self._send_action_to_bridge(action)
 
-        if action_type == "beep":
-            self._send_action_to_bridge(action)
-            success = True
-
-        elif action_type == "locate":
-            self._send_action_to_bridge(action)
-            success = True
-
-        elif action_type == "setFanSpeed":
-            # Extract speed parameter
-            speed = "medium"  # default
-            for param in action_params:
-                if param.get("key") == "speed":
-                    speed = param.get("value", "medium")
-
-            # Send setFanSpeed action
-            fan_action = {
-                "actionType": "setFanSpeed",
-                "actionId": action_id,
-                "blockingType": blocking_type,
-                "actionParameters": [{"key": "speed", "value": speed}]
-            }
-            self._send_action_to_bridge(fan_action)
-            self.log(f"   Fan speed → {speed}", "info")
-            success = True
-
-        elif action_type == "setVolume":
-            # Extract volume parameter
-            volume = 50  # default
-            for param in action_params:
-                if param.get("key") == "volume":
-                    volume = param.get("value", 50)
-
-            volume_action = {
-                "actionType": "setVolume",
-                "actionId": action_id,
-                "blockingType": blocking_type,
-                "actionParameters": [{"key": "volume", "value": volume}]
-            }
-            self._send_action_to_bridge(volume_action)
-            self.log(f"   Volume → {volume}", "info")
-            success = True
-
-        elif action_type in ["startCleaning", "stopCleaning", "pauseCleaning"]:
-            self._send_action_to_bridge(action)
-            success = True
-
-        elif action_type in ["dock", "quickCharge"]:
-            self._send_action_to_bridge(action)
-            success = True
-
-        else:
-            # Unknown action - forward to bridge anyway
-            self.log(f"   ⚠ Unknown action type: {action_type}", "warning")
-            self._send_action_to_bridge(action)
-            success = True
-
-        # Wait for action to complete if blocking
         if wait and success:
-            # Simple delay for actions (in real system, wait for confirmation)
             action_delay = self._get_action_delay(action_type)
             time.sleep(action_delay)
 
-        # Update action state
         if success:
             self._update_action_state(action_id, "FINISHED")
             self.log(f"   ✓ {action_type} finished", "success")
@@ -867,7 +1349,7 @@ class RobotBackend:
             self.log(f"   ✗ {action_type} failed", "error")
 
     def _get_action_delay(self, action_type: str) -> float:
-        """Get delay time for action completion"""
+        """Get delay time for action completion."""
         delays = {
             "beep": 1.0,
             "locate": 2.0,
@@ -882,7 +1364,7 @@ class RobotBackend:
         return delays.get(action_type, 0.5)
 
     def _send_action_to_bridge(self, action: Dict):
-        """Send action to bridge for execution"""
+        """Send action to bridge for execution."""
         action_msg = {
             "headerId": self._next_header_id(),
             "timestamp": self._get_timestamp(),
@@ -894,7 +1376,7 @@ class RobotBackend:
         self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def _update_action_state(self, action_id: str, status: str, result: str = ""):
-        """Update action state"""
+        """Update action state."""
         for action_state in self.action_states:
             if action_state.actionId == action_id:
                 action_state.actionStatus = status
@@ -903,293 +1385,21 @@ class RobotBackend:
                 break
 
     # ========================================================================
-    # NAVIGATION
-    # ========================================================================
-
-    def _advance_mission(self):
-        """Advance to next node"""
-        with self.lock:
-            if self.paused:
-                return
-
-            if not self.mission_queue:
-                has_horizon = any(not ns.released for ns in self.node_states)
-                if has_horizon:
-                    self.log(f"⏸ Waiting at decision point", "warning")
-                    self.waiting_at_decision_point = True
-                    self.new_base_request = False  # Already at decision point, too late
-                    self.current_target_node = None
-                else:
-                    self._complete_mission()
-                return
-
-            next_node = self.mission_queue.pop(0)
-            self.current_target_node = next_node
-
-            # Check if approaching decision point (next node is last in base, horizon exists)
-            # newBaseRequest should be TRUE when we're heading to the decision point
-            has_horizon = any(not ns.released for ns in self.node_states)
-            is_heading_to_decision_point = (len(self.mission_queue) == 0) and has_horizon
-
-            if is_heading_to_decision_point:
-                self.new_base_request = True
-                self.log(f"📡 newBaseRequest: true (approaching decision point)", "warning")
-            else:
-                self.new_base_request = False
-
-            # Get pending actions for this node
-            self.pending_node_actions = []
-            for ns in self.node_states:
-                if ns.nodeId == next_node:
-                    self.pending_node_actions = ns.actions.copy()
-                    break
-
-            if next_node in self.gui_node_states:
-                self.gui_node_states[next_node] = "planned"
-
-            self.log(f"→ Moving to: {next_node}", "info")
-            self._send_navigation_command(next_node)
-
-    def _send_navigation_command(self, node_id: str):
-        """
-        Trigger navigation to a node.
-
-        With the new architecture (Issue 1 fix):
-        - Backend publishes order on /order topic
-        - Bridge subscribes to /order and sends goTo to robot
-        - Backend just tracks state
-        """
-        self.last_command_ts = time.time()
-
-        if node_id == "home":
-            # Dock command still goes via /instantActions (bridge handles it)
-            self.log(f"🏠 Navigating to: home (dock command)", "info")
-            self._send_dock_command()
-        else:
-            self._send_goto(node_id)
-
-    def _send_goto(self, node_id: str):
-        """
-        ISSUE 1 FIX: Backend no longer sends goTo on /instantActions.
-        Navigation is handled by bridge reading from /order topic.
-        This method publishes the order and logs the navigation intent.
-        """
-        target = None
-
-        # First try: Get from order's nodePosition
-        for ns in self.node_states:
-            if ns.nodeId == node_id and ns.nodePosition:
-                pos = ns.nodePosition
-                if pos.get("x") is not None and pos.get("y") is not None:
-                    target = {"x": pos["x"], "y": pos["y"]}
-                    break
-
-        # Second try: Get from config NODES
-        if not target and node_id in NODES:
-            node_config = NODES[node_id]
-            target = {"x": node_config["x"], "y": node_config["y"]}
-
-        if not target:
-            self.log(f"✗ Unknown node: {node_id} (not in order or config)", "error")
-            return
-
-        # Log what's happening with the new architecture
-        self.log(f"🎯 Navigating to: {node_id} ({int(target['x'])}, {int(target['y'])})", "info")
-        self.log(f"   📤 Publishing order on /order → Bridge will send goTo to robot", "info")
-
-        # Publish order so bridge can navigate
-        self._publish_current_order()
-
-    def _send_dock_command(self):
-        """Send dock command - this still goes via /instantActions"""
-        action_msg = {
-            "headerId": self._next_header_id(),
-            "timestamp": self._get_timestamp(),
-            "version": VDA_VERSION,
-            "manufacturer": MANUFACTURER,
-            "serialNumber": SERIAL_NUMBER,
-            "actions": [{
-                "actionType": "dock",
-                "actionId": f"dock_{int(time.time() * 1000)}",
-                "blockingType": "HARD",
-                "actionParameters": []
-            }]
-        }
-        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
-
-    def _complete_mission(self):
-        """Complete mission"""
-        self.log(f"✅ ORDER COMPLETE: Order #{self.order_id}", "success")
-        self.mission_active = False
-        self.current_target_node = None
-        self.waiting_at_decision_point = False
-        self.new_base_request = False
-
-        # Clear VDA 5050 state (nodes/edges completed)
-        self.node_states = []
-        self.edge_states = []
-        self.action_states = []
-
-        # ISSUE 2 FIX: Keep orderId and orderUpdateId until NEW order received
-        # Do NOT reset: self.order_id, self.order_update_id, self.current_order
-        # These will be cleared when a new order is received in _process_new_order()
-        self.log(f"   📋 Keeping Order #{self.order_id} until new order arrives", "info")
-
-        # Reset all node colors to idle
-        self._reset_gui_colors()
-
-    def _reset_gui_colors(self):
-        """Reset all nodes to idle"""
-        for node_id in NODES:
-            self.gui_node_states[node_id] = "idle"
-
-    # ========================================================================
-    # MAIN LOOP
-    # ========================================================================
-
-    def _main_loop(self):
-        """Main loop"""
-        while self.running:
-            time.sleep(0.1)  # Reduced from 0.2 for faster arrival detection
-
-            self._update_animation()
-
-            # Publish state periodically
-            if time.time() - self.last_state_publish_ts > STATE_PUBLISH_INTERVAL:
-                self._publish_state()
-                self.last_state_publish_ts = time.time()
-
-            # Publish connection state every second
-            if time.time() - self.last_connection_publish_ts > CONNECTION_PUBLISH_INTERVAL:
-                self._publish_connection_state("ONLINE")
-                self.last_connection_publish_ts = time.time()
-
-            if not self.mission_active or not self.current_target_node:
-                continue
-
-            if self.paused or self.waiting_at_decision_point:
-                continue
-
-            # Check arrival - don't let command cooldown block arrival detection!
-            if self._is_at_node(self.current_target_node) and not self.is_driving:
-                self._on_node_reached(self.current_target_node)
-            # Only apply cooldown for stalled retry commands
-            elif time.time() - self.last_command_ts > STALLED_TIMEOUT_SEC and not self.is_driving:
-                self.log(f"⚠ Stalled, retrying...", "warning")
-                self._send_navigation_command(self.current_target_node)
-
-    def _on_node_reached(self, node_id: str):
-        """Node reached - execute pending actions then advance"""
-        self.log(f"✓ ARRIVED: {node_id}", "success")
-
-        self.last_node_id = node_id
-        self.traversed_node_indices += 1
-
-        for ns in self.node_states:
-            if ns.nodeId == node_id:
-                self.last_node_sequence_id = ns.sequenceId
-
-                # ===== FIX: Remove the incoming edge =====
-                # VDA 5050: When node is traversed, remove edge leading TO it
-                # Edge sequenceId = Node sequenceId - 1
-                incoming_edge_seq_id = ns.sequenceId - 1
-                self.edge_states = [
-                    es for es in self.edge_states
-                    if es.sequenceId != incoming_edge_seq_id
-                ]
-                self.log(f"   Removed edge with seqId {incoming_edge_seq_id}")
-
-                # Log node removal as well
-                self.log(f"   Removed node {node_id} with seqId {ns.sequenceId}")
-                # ===== END FIX =====
-
-                break
-
-        if node_id in self.gui_node_states:
-            self.gui_node_states[node_id] = "done"
-
-        # Execute pending actions for this node
-        if self.pending_node_actions:
-            self.log(f"   Executing {len(self.pending_node_actions)} actions...", "info")
-            self._execute_node_actions(self.pending_node_actions)
-            self.pending_node_actions = []
-
-        self._advance_mission()
-
-    def _is_at_node(self, node_id: str) -> bool:
-        """Check if at node"""
-        target = None
-
-        # First try: Get from order's nodePosition
-        for ns in self.node_states:
-            if ns.nodeId == node_id and ns.nodePosition:
-                pos = ns.nodePosition
-                if pos.get("x") is not None and pos.get("y") is not None:
-                    target = {"x": pos["x"], "y": pos["y"]}
-                    break
-
-        # Second try: Get from config NODES
-        if not target and node_id in NODES:
-            node_config = NODES[node_id]
-            target = {"x": node_config["x"], "y": node_config["y"]}
-
-        if not target:
-            return False
-
-        dist = math.sqrt(
-            (self.pose["x"] - target["x"]) ** 2 +
-            (self.pose["y"] - target["y"]) ** 2
-        )
-        return dist < ARRIVAL_TOLERANCE_MM
-
-    # ========================================================================
-    # INSTANT ACTIONS (pause, resume, stop from master control)
-    # ========================================================================
-
-    def _handle_instant_actions(self, payload: Dict):
-        """Handle instant actions from master control"""
-        actions = payload.get("actions", [])
-        for action in actions:
-            action_type = action.get("actionType", "")
-
-            # Ignore actions that the backend sends itself (goTo, dock, etc.)
-            # These are already sent to bridge via the same topic
-            if action_type in ["goTo", "dock", "quickCharge", "beep", "locate",
-                               "startCleaning", "stopCleaning", "pauseCleaning",
-                               "setFanSpeed", "stopMovement", "pauseMovement", "resumeMovement"]:
-                # Bridge handles these directly - don't log or re-publish
-                return
-
-            self.log(f"📥 Instant Action: {action_type}", "info")
-
-            if action_type == "stopPause" or action_type == "resumeOrder":
-                self.resume_mission()
-            elif action_type == "startPause" or action_type == "pauseOrder":
-                self.pause_mission()
-            elif action_type == "cancelOrder":
-                self.emergency_stop()
-
-    # ========================================================================
     # STATE PUBLISHING
     # ========================================================================
 
     def _publish_state(self):
-        """Publish VDA5050 state"""
+        """Publish VDA5050 state."""
         if not self.client:
             return
 
-        # Build remaining nodeStates
+        # Build remaining nodeStates (not traversed)
         remaining_node_states = []
-        for i, ns in enumerate(self.node_states):
-            if i >= self.traversed_node_indices:
+        for ns in self.node_states:
+            if ns.sequenceId not in self._traversed_sequence_ids:
                 remaining_node_states.append(ns.to_dict())
 
-        # Build remaining edgeStates
-        remaining_edge_states = []
-        for es in self.edge_states:
-            remaining_edge_states.append(es.to_dict())
-
-        # Build actionStates
+        remaining_edge_states = [es.to_dict() for es in self.edge_states]
         action_states_list = [a.to_dict() for a in self.action_states]
 
         state = {
@@ -1200,7 +1410,7 @@ class RobotBackend:
             "serialNumber": SERIAL_NUMBER,
             "orderId": self.order_id,
             "orderUpdateId": self.order_update_id,
-            "lastNodeId": self.last_node_id or "",  # VDA 5050: empty string if no node traversed
+            "lastNodeId": self.last_node_id or "",
             "lastNodeSequenceId": self.last_node_sequence_id,
             "driving": self.is_driving,
             "paused": self.paused,
@@ -1232,32 +1442,86 @@ class RobotBackend:
 
         self.client.publish(TOPIC_STATE, json.dumps(state))
 
-    def _publish_current_order(self):
-        """Publish current order to MQTT for visibility/debugging"""
+    def _publish_current_order(self, is_update: bool = None):
+        """
+        Publish current order to MQTT.
+
+        VDA 5050 SPEC for updates:
+        "The last node of the previous base is the first base node in the updated order.
+         The other nodes and edges from the previous base are NOT RESENT."
+
+        For new orders: Publish all nodes
+        For updates: Publish only from stitch point (last traversed node) onwards
+        """
         if not self.client or not self.node_states:
             return
 
-        # Build nodes with positions
+        # Determine if this is an update (orderUpdateId > 0)
+        if is_update is None:
+            is_update = self.order_update_id > 0
+
+        # Find nodes to publish
+        if is_update:
+            # For updates: Find stitch point = LAST TRAVERSED node
+            # This is "the last node of the previous base"
+            stitch_seq_id = None
+            for ns in self.node_states:
+                if ns.sequenceId in self._traversed_sequence_ids:
+                    stitch_seq_id = ns.sequenceId  # Keep updating to find the LAST one
+
+            if stitch_seq_id is None:
+                # No traversed nodes - shouldn't happen for a valid update
+                # Fall back to first released node
+                for ns in self.node_states:
+                    if ns.released:
+                        stitch_seq_id = ns.sequenceId
+                        break
+
+            if stitch_seq_id is None:
+                # Still no stitch point - publish all
+                nodes_to_publish = self.node_states
+                edges_to_publish = self.edge_states
+                self.log("⚠ No stitch point found, publishing all nodes", "warning")
+            else:
+                # Publish from stitch point onwards (stitch node + everything after)
+                nodes_to_publish = [ns for ns in self.node_states
+                                    if ns.sequenceId >= stitch_seq_id]
+
+                # Get corresponding edges
+                # Edge leading TO stitch node has seq = stitch_seq - 1
+                # We DON'T include that edge (it's already traversed)
+                # We include edges from stitch node onwards (seq >= stitch_seq + 1)
+                # Actually, we include edges that connect published nodes
+                min_edge_seq = stitch_seq_id + 1  # First edge AFTER stitch node
+                edges_to_publish = [es for es in self.edge_states
+                                    if es.sequenceId >= min_edge_seq]
+        else:
+            # For new orders: Publish all
+            nodes_to_publish = self.node_states
+            edges_to_publish = self.edge_states
+
+        # Build nodes list
         nodes_list = []
-        for ns in self.node_states:
+        for ns in nodes_to_publish:
             node_dict = {
                 "nodeId": ns.nodeId,
                 "sequenceId": ns.sequenceId,
                 "released": ns.released,
                 "actions": []
             }
-            # Add position if available
             if ns.nodeId in NODES:
                 node_dict["nodePosition"] = {
                     "x": NODES[ns.nodeId]["x"],
                     "y": NODES[ns.nodeId]["y"],
                     "mapId": MAP_ID
                 }
+            elif ns.nodePosition:
+                node_dict["nodePosition"] = ns.nodePosition
             nodes_list.append(node_dict)
 
-        # Build edges
+        # Build edges list
         edges_list = []
-        for es in self.edge_states:
+        for es in edges_to_publish:
             edges_list.append({
                 "edgeId": es.edgeId,
                 "sequenceId": es.sequenceId,
@@ -1280,40 +1544,37 @@ class RobotBackend:
         }
 
         self.client.publish(TOPIC_ORDER, json.dumps(order))
-        self.log(f"📤 Order published to MQTT", "info")
+
+        if is_update:
+            self.log(f"📤 Order UPDATE published (stitch + {len(nodes_list)} nodes)", "info")
+        else:
+            self.log(f"📤 Order published ({len(nodes_list)} nodes)", "info")
 
     # ========================================================================
-    # GUI CONTROLS - PAUSE/RESUME/STOP
+    # GUI CONTROLS
     # ========================================================================
 
     def pause_mission(self):
-        """Pause mission - sends pause command to robot"""
-        self.paused = True
-        self.log("⏸ Mission PAUSED", "warning")
+        """
+        Stop mission (halt robot movement).
 
-        # Send pause command to bridge
-        action_msg = {
-            "headerId": self._next_header_id(),
-            "timestamp": self._get_timestamp(),
-            "version": VDA_VERSION,
-            "manufacturer": MANUFACTURER,
-            "serialNumber": SERIAL_NUMBER,
-            "actions": [{
-                "actionType": "pauseMovement",
-                "actionId": f"pause_{int(time.time() * 1000)}",
-                "blockingType": "HARD",
-                "actionParameters": []
-            }]
-        }
-        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
+        When stopping:
+        1. Set paused = True
+        2. Send stop command to halt robot movement
+        """
+        with self.lock:
+            if not self.mission_active and not self.waiting_at_decision_point:
+                self.log("⚠ No active mission to stop", "warning")
+                return
 
-    def resume_mission(self):
-        """Resume mission - sends resume command to robot"""
-        if self.mission_queue or self.current_target_node or self.waiting_at_decision_point:
-            self.paused = False
-            self.log("▶ Mission RESUMED", "success")
+            if self.paused:
+                self.log("⚠ Mission is already stopped", "info")
+                return
 
-            # Send resume command to bridge
+            self.paused = True
+            self.log("⏹ Mission STOPPED", "warning")
+
+            # Send stop movement command via instant actions
             action_msg = {
                 "headerId": self._next_header_id(),
                 "timestamp": self._get_timestamp(),
@@ -1321,62 +1582,459 @@ class RobotBackend:
                 "manufacturer": MANUFACTURER,
                 "serialNumber": SERIAL_NUMBER,
                 "actions": [{
-                    "actionType": "resumeMovement",
-                    "actionId": f"resume_{int(time.time() * 1000)}",
+                    "actionType": "stopMovement",
+                    "actionId": self._next_action_id("stop"),
                     "blockingType": "HARD",
                     "actionParameters": []
                 }]
             }
             self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
-            # If we have a current target, resend navigation command
-            if self.current_target_node and not self.waiting_at_decision_point:
-                self._send_navigation_command(self.current_target_node)
+    def resume_mission(self):
+        """
+        Resume mission after stop.
+
+        Sends resumeOrder instant action to bridge which will:
+        1. Reactivate ORDER_STATE
+        2. Call navigate_to_next_node() to continue
+        """
+        with self.lock:
+            if not self.mission_active and not self.waiting_at_decision_point:
+                self.log("⚠ No active mission to resume", "warning")
+                return
+
+            if not self.paused:
+                self.log("⚠ Mission is not stopped", "info")
+                return
+
+            self.paused = False
+            self.log("▶ Mission RESUMED", "success")
+
+            if self.waiting_at_decision_point:
+                self.log("   ⚠ Waiting for horizon release", "warning")
+                return
+
+            # Send resumeOrder instant action to bridge
+            if self.current_target_node:
+                self.log(f"   Continuing to: {self.current_target_node}", "info")
+
+                action_msg = {
+                    "headerId": self._next_header_id(),
+                    "timestamp": self._get_timestamp(),
+                    "version": VDA_VERSION,
+                    "manufacturer": MANUFACTURER,
+                    "serialNumber": SERIAL_NUMBER,
+                    "actions": [{
+                        "actionType": "resumeOrder",
+                        "actionId": self._next_action_id("resume"),
+                        "blockingType": "HARD",
+                        "actionParameters": []
+                    }]
+                }
+                self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def emergency_stop(self):
-        """Emergency stop - cancels order and stops robot"""
-        self.log("🛑 ORDER CANCELLED", "error")
-
-        # Send stop command to bridge
-        action_msg = {
-            "headerId": self._next_header_id(),
-            "timestamp": self._get_timestamp(),
-            "version": VDA_VERSION,
-            "manufacturer": MANUFACTURER,
-            "serialNumber": SERIAL_NUMBER,
-            "actions": [{
-                "actionType": "stopMovement",
-                "actionId": f"stop_{int(time.time() * 1000)}",
-                "blockingType": "HARD",
-                "actionParameters": []
-            }]
-        }
-        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
-
-        # Clear order state
-        self.mission_active = False
-        self.paused = False
-        self.mission_queue = []
-        self.current_target_node = None
-        self.waiting_at_decision_point = False
-        # ISSUE 2 FIX: Keep orderId until new order received
-        # self.current_order = None  # Keep reference
-        # self.order_id = ""  # Keep ID
-        self.node_states = []
-        self.edge_states = []
-        self.action_states = []
-        self._reset_gui_colors()
+        """Emergency stop - use cancelOrder internally."""
+        self._handle_cancel_order({"actionId": self._next_action_id("cancel")})
 
     def stop_mission(self):
-        """Stop current mission - alias for emergency_stop"""
+        """Alias for emergency_stop."""
         self.emergency_stop()
 
+    # ========================================================================
+    # GUI MISSION SUPPORT - WITH STABLE SEQUENCE IDS
+    # ========================================================================
+
+    def set_mission_sequence(self, path: List[str]):
+        """Set mission from GUI with stable sequence IDs."""
+        with self.lock:
+            if not path or len(path) < 2:
+                self.log("✗ Invalid path", "error")
+                return
+
+            if self.mission_active:
+                self.log("⏹ Cancelling current mission", "warning")
+                self.mission_active = False
+                self.mission_queue = []
+                self.current_target_node = None
+
+            self.log(f"🎯 GUI Mission: {' → '.join(path)}", "info")
+            self._reset_gui_colors()
+
+            # Generate new order ID
+            self._order_id_counter += 1
+            self.order_id = str(self._order_id_counter)
+            self.order_update_id = 0
+            self.current_order = {"orderId": self.order_id, "orderUpdateId": 0}
+
+            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
+
+            # Clear state
+            self.node_states = []
+            self.edge_states = []
+            self.action_states = []
+            self._traversed_sequence_ids = set()
+
+            # Create nodes with stable sequenceIds
+            for i, node_id in enumerate(path):
+                if node_id in NODES:
+                    ns = NodeState(
+                        nodeId=node_id,
+                        sequenceId=i * 2,
+                        released=True,
+                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "mapId": MAP_ID}
+                    )
+                    self.node_states.append(ns)
+
+            # Create edges
+            for i in range(len(path) - 1):
+                es = EdgeState(
+                    edgeId=f"e_{path[i]}_{path[i + 1]}",
+                    sequenceId=i * 2 + 1,
+                    released=True,
+                    startNodeId=path[i],
+                    endNodeId=path[i + 1]
+                )
+                self.edge_states.append(es)
+
+            # Build mission queue
+            self._build_mission_queue()
+
+            # Check if already at first node
+            if self.mission_queue:
+                first_id, first_seq = self.mission_queue[0]
+                if first_id == self.last_node_id or self._is_at_node(first_id):
+                    self._mark_node_traversed(first_id, first_seq)
+                    self.mission_queue.pop(0)
+
+            if not self.mission_queue:
+                self.log("Already at destination", "info")
+                return
+
+            self.mission_active = True
+            self.paused = False
+            self.waiting_at_decision_point = False
+
+            self._publish_current_order(is_update=False)
+            self._advance_mission()
+
+    def set_mission_with_horizon(self, path: List[str], base_count: int):
+        """Set mission with base/horizon split."""
+        with self.lock:
+            if not path or len(path) < 2:
+                self.log("✗ Invalid path", "error")
+                return
+
+            if self.mission_active:
+                self.log("⏹ Cancelling current mission", "warning")
+                self.mission_active = False
+                self.mission_queue = []
+                self.current_target_node = None
+
+            base_count = max(1, min(base_count, len(path)))
+            horizon_count = len(path) - base_count
+
+            if horizon_count > 0:
+                self.log(f"🎯 Mission with Horizon:", "info")
+                self.log(f"   Base ({base_count}): {' → '.join(path[:base_count])}", "info")
+                self.log(f"   Horizon ({horizon_count}): {' → '.join(path[base_count:])}", "warning")
+            else:
+                self.log(f"🎯 GUI Mission: {' → '.join(path)}", "info")
+
+            self._reset_gui_colors()
+
+            # Generate new order ID
+            self._order_id_counter += 1
+            self.order_id = str(self._order_id_counter)
+            self.order_update_id = 0
+            self.current_order = {"orderId": self.order_id, "orderUpdateId": 0}
+
+            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
+
+            self.node_states = []
+            self.edge_states = []
+            self.action_states = []
+            self._traversed_sequence_ids = set()
+
+            # Create node states with released flag
+            for i, node_id in enumerate(path):
+                if node_id in NODES:
+                    is_released = (i < base_count)
+                    ns = NodeState(
+                        nodeId=node_id,
+                        sequenceId=i * 2,
+                        released=is_released,
+                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "mapId": MAP_ID}
+                    )
+                    self.node_states.append(ns)
+
+            # Create edges
+            for i in range(len(path) - 1):
+                is_released = (i < base_count - 1)
+                es = EdgeState(
+                    edgeId=f"e_{path[i]}_{path[i + 1]}",
+                    sequenceId=i * 2 + 1,
+                    released=is_released,
+                    startNodeId=path[i],
+                    endNodeId=path[i + 1]
+                )
+                self.edge_states.append(es)
+
+            # Build queue from BASE nodes only
+            self._build_mission_queue()
+
+            # Check if at first node
+            if self.mission_queue:
+                first_id, first_seq = self.mission_queue[0]
+                if first_id == self.last_node_id or self._is_at_node(first_id):
+                    self._mark_node_traversed(first_id, first_seq)
+                    self.mission_queue.pop(0)
+
+            if not self.mission_queue:
+                if horizon_count > 0:
+                    self.log("⏸ At decision point - waiting for horizon release", "warning")
+                    self.waiting_at_decision_point = True
+                    self.new_base_request = True
+                else:
+                    self.log("Already at destination", "info")
+                return
+
+            self.mission_active = True
+            self.paused = False
+            self.waiting_at_decision_point = False
+
+            self._publish_current_order(is_update=False)
+            self._advance_mission()
+
+    def release_horizon_nodes(self, count: int = 1, target_node_id: str = None):
+        """
+        Release N horizon nodes to base (BATCH RELEASE).
+
+        Args:
+            count: Number of nodes to release (default 1)
+            target_node_id: If specified, release up to and including this node
+        """
+        with self.lock:
+            if not self.node_states:
+                self.log("No active order", "warning")
+                return
+
+            # Find horizon nodes
+            horizon_nodes = [(i, ns) for i, ns in enumerate(self.node_states) if not ns.released]
+
+            if not horizon_nodes:
+                self.log("No horizon nodes to release", "info")
+                return
+
+            # Determine how many to release
+            if target_node_id:
+                # Release up to target node
+                nodes_to_release = []
+                for idx, ns in horizon_nodes:
+                    nodes_to_release.append((idx, ns))
+                    if ns.nodeId == target_node_id:
+                        break
+            else:
+                # Release N nodes
+                nodes_to_release = horizon_nodes[:count]
+
+            # Release nodes
+            for idx, ns in nodes_to_release:
+                ns.released = True
+                self.log(f"✓ Released: {ns.nodeId} (seq: {ns.sequenceId})", "success")
+
+                # Add to mission queue
+                if ns.sequenceId not in self._traversed_sequence_ids:
+                    self.mission_queue.append((ns.nodeId, ns.sequenceId))
+                    if ns.nodeId in self.gui_node_states:
+                        self.gui_node_states[ns.nodeId] = "planned"
+
+                # Release corresponding edge
+                edge_seq = ns.sequenceId - 1
+                for es in self.edge_states:
+                    if es.sequenceId == edge_seq and not es.released:
+                        es.released = True
+                        self.log(f"   Released edge: {es.edgeId}", "info")
+                        break
+
+            # Sort queue by sequence
+            self.mission_queue.sort(key=lambda x: x[1])
+
+            # Increment order update ID
+            self.order_update_id += 1
+            if self.current_order:
+                self.current_order["orderUpdateId"] = self.order_update_id
+
+            # CRITICAL: Publish as UPDATE (stitch point + released nodes only)
+            self._publish_current_order(is_update=True)
+            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
+
+            # Continue if waiting
+            if self.waiting_at_decision_point:
+                self.waiting_at_decision_point = False
+                self.new_base_request = False
+                self.log("▶ Continuing mission after horizon release", "success")
+                self._advance_mission()
+
+    def release_horizon_node(self, node_id: str = None):
+        """Release single horizon node (backward compatible)."""
+        self.release_horizon_nodes(count=1, target_node_id=node_id)
+
+    # ========================================================================
+    # MAIN LOOP
+    # ========================================================================
+
+    def _main_loop(self):
+        """Main loop."""
+        while self.running:
+            time.sleep(0.1)
+
+            self._update_animation()
+
+            if time.time() - self.last_state_publish_ts > STATE_PUBLISH_INTERVAL:
+                self._publish_state()
+                self.last_state_publish_ts = time.time()
+
+            if time.time() - self.last_connection_publish_ts > CONNECTION_PUBLISH_INTERVAL:
+                self._publish_connection_state("ONLINE")
+                self.last_connection_publish_ts = time.time()
+
+            if not self.mission_active or not self.current_target_node:
+                continue
+
+            if self.paused or self.waiting_at_decision_point:
+                continue
+
+            # Check arrival
+            if self._is_at_node(self.current_target_node) and not self.is_driving:
+                self._on_node_reached(self.current_target_node,
+                                      self.current_target_sequence_id or 0)
+            elif time.time() - self.last_command_ts > STALLED_TIMEOUT_SEC and not self.is_driving:
+                self.log(f"⚠ Stalled, retrying...", "warning")
+                self._send_navigation_command(self.current_target_node,
+                                              self.current_target_sequence_id or 0)
+
+    # ========================================================================
+    # UTILITY
+    # ========================================================================
+
+    def _next_header_id(self) -> int:
+        self._header_id += 1
+        return self._header_id
+
+    def _next_action_id(self, action_type: str) -> str:
+        """
+        Generate simple sequential action IDs like 'dock1', 'dock2', 'stop1', etc.
+        """
+        if action_type not in self._action_id_counters:
+            self._action_id_counters[action_type] = 0
+        self._action_id_counters[action_type] += 1
+        return f"{action_type}{self._action_id_counters[action_type]}"
+
+    def _get_timestamp(self) -> str:
+        return time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
+
+    def _reset_gui_colors(self):
+        """Reset all nodes to idle."""
+        for node_id in NODES:
+            self.gui_node_states[node_id] = "idle"
+
+    # ========================================================================
+    # ERROR MANAGEMENT
+    # ========================================================================
+
+    def add_error(self, error_type: str, error_level: str = "WARNING",
+                  error_description: str = "", error_references: List[Dict] = None):
+        """Add an error."""
+        error = {
+            "errorType": error_type,
+            "errorLevel": error_level,
+            "errorDescription": error_description,
+            "errorReferences": error_references or []
+        }
+        self.errors.append(error)
+        self.log(f"⚠ Error added: {error_type} ({error_level})", "error")
+
+    def clear_error(self, error_type: str):
+        """Remove an error by type."""
+        self.errors = [e for e in self.errors if e.get("errorType") != error_type]
+
+    def clear_all_errors(self):
+        """Clear all errors."""
+        self.errors = []
+
+    def get_gui_state(self) -> Dict:
+        return {
+            "pose": self.display_pose,
+            "battery": self.battery,
+            "charging": self.charging,
+            "mission_active": self.mission_active,
+            "current_target": self.current_target_node,
+            "gui_node_states": self.gui_node_states,
+            "order_id": self.order_id,
+            "waiting_at_decision_point": self.waiting_at_decision_point,
+        }
+
+    @property
+    def current_order_id(self):
+        """Alias for order_id."""
+        return self.order_id
+
+    def send_goto_node(self, target_node: str):
+        """Navigate to a target node."""
+        with self.lock:
+            start_node = self.last_node_id
+
+            if not start_node:
+                start_node = self._find_nearest_node()
+                if start_node:
+                    self.log(f"📍 Starting from nearest node: {start_node}", "info")
+                    self.last_node_id = start_node
+                else:
+                    self.log("✗ Cannot determine starting position", "error")
+                    return
+
+            if start_node == target_node:
+                self.log(f"Already at {target_node}", "info")
+                return
+
+            path = self._find_path(start_node, target_node)
+
+            if not path:
+                self.log(f"✗ No valid path from {start_node} to {target_node}", "error")
+                return
+
+            self.log(f"📍 Path: {' → '.join(path)}", "info")
+            self.set_mission_sequence(path)
+
+    def send_mission(self, path: List[str]):
+        """Start a mission with the given path."""
+        if not path:
+            self.log("✗ Empty path provided", "error")
+            return
+
+        if not self.last_node_id:
+            nearest = self._find_nearest_node()
+            if nearest:
+                self.last_node_id = nearest
+                self.log(f"📍 Current position: {nearest}", "info")
+            else:
+                self.log("✗ Cannot determine starting position", "error")
+                return
+
+        if self.last_node_id != path[0]:
+            prefix_path = self._find_path(self.last_node_id, path[0])
+            if prefix_path and len(prefix_path) > 1:
+                full_path = prefix_path[:-1] + path
+                self.log(f"📍 Extended path: {' → '.join(full_path)}", "info")
+                self.set_mission_sequence(full_path)
+            else:
+                self.set_mission_sequence(path)
+        else:
+            self.set_mission_sequence(path)
+
     def send_instant_action(self, action_type: str):
-        """
-        Send an instant action command.
-        Called by GUI for actions like pause, resume, beep, locate, dock.
-        """
-        # Map GUI action names to actual action types
+        """Send an instant action command."""
         action_map = {
             "pauseMovement": "startPause",
             "resumeMovement": "stopPause",
@@ -1396,7 +2054,6 @@ class RobotBackend:
         elif actual_action == "dock":
             self._send_dock_command()
         else:
-            # Send action to bridge
             action_msg = {
                 "headerId": self._next_header_id(),
                 "timestamp": self._get_timestamp(),
@@ -1405,7 +2062,7 @@ class RobotBackend:
                 "serialNumber": SERIAL_NUMBER,
                 "actions": [{
                     "actionType": actual_action,
-                    "actionId": f"{actual_action}_{int(time.time() * 1000)}",
+                    "actionId": self._next_action_id(actual_action),
                     "blockingType": "NONE",
                     "actionParameters": []
                 }]
@@ -1413,304 +2070,14 @@ class RobotBackend:
             self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
             self.log(f"📤 Instant action: {actual_action}", "info")
 
-    # ========================================================================
-    # GUI MISSION SUPPORT
-    # ========================================================================
-
-    def set_mission_sequence(self, path: List[str]):
-        """Set mission from GUI"""
-        with self.lock:
-            if not path or len(path) < 2:
-                self.log("✗ Invalid path", "error")
-                return
-
-            if self.mission_active:
-                self.log("⏹ Cancelling current mission", "warning")
-                self.mission_active = False
-                self.mission_queue = []
-                self.current_target_node = None
-
-            self.log(f"🎯 GUI Mission: {' → '.join(path)}", "info")
-
-            self._reset_gui_colors()
-
-            # Generate new numeric order ID (always increments, never goes back)
-            self._order_id_counter += 1
-            self.order_id = self._order_id_counter
-            self.order_update_id = 0  # Reset to 0 for new order
-            self.current_order = {"orderId": self.order_id, "orderUpdateId": 0}
-
-            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
-
-            self.node_states = []
-            self.edge_states = []
-            self.action_states = []
-            self.traversed_node_indices = 0
-
-            for i, node_id in enumerate(path):
-                if node_id in NODES:
-                    ns = NodeState(
-                        nodeId=node_id,
-                        sequenceId=i * 2,
-                        released=True,
-                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "mapId": MAP_ID}
-                    )
-                    self.node_states.append(ns)
-
-            for i in range(len(path) - 1):
-                es = EdgeState(
-                    edgeId=f"e_{path[i]}_{path[i + 1]}",
-                    sequenceId=i * 2 + 1,
-                    released=True,
-                    startNodeId=path[i],
-                    endNodeId=path[i + 1]
-                )
-                self.edge_states.append(es)
-
-            if path[0] == self.last_node_id:
-                path = path[1:]
-                self.traversed_node_indices = 1
-
-            if not path:
-                self.log("Already at destination", "info")
-                return
-
-            self.mission_queue = path.copy()
-            for node_id in path:
-                if node_id in self.gui_node_states:
-                    self.gui_node_states[node_id] = "planned"
-
-            self.mission_active = True
-            self.paused = False
-            self.waiting_at_decision_point = False
-
-            # Publish order to MQTT for visibility
-            self._publish_current_order()
-
-            self._advance_mission()
-
-    def set_mission_with_horizon(self, path: List[str], base_count: int):
-        """
-        Set mission with base/horizon split.
-
-        Args:
-            path: Full path of node IDs
-            base_count: Number of nodes to release (base), rest stay in horizon
-        """
-        with self.lock:
-            if not path or len(path) < 2:
-                self.log("✗ Invalid path", "error")
-                return
-
-            if self.mission_active:
-                self.log("⏹ Cancelling current mission", "warning")
-                self.mission_active = False
-                self.mission_queue = []
-                self.current_target_node = None
-
-            # Clamp base_count
-            base_count = max(1, min(base_count, len(path)))
-            horizon_count = len(path) - base_count
-
-            if horizon_count > 0:
-                self.log(f"🎯 Mission with Horizon:", "info")
-                self.log(f"   Base ({base_count}): {' → '.join(path[:base_count])}", "info")
-                self.log(f"   Horizon ({horizon_count}): {' → '.join(path[base_count:])}", "warning")
-            else:
-                self.log(f"🎯 GUI Mission: {' → '.join(path)}", "info")
-
-            self._reset_gui_colors()
-
-            # Generate new numeric order ID (always increments, never goes back)
-            self._order_id_counter += 1
-            self.order_id = self._order_id_counter
-            self.order_update_id = 0  # Reset to 0 for new order
-            self.current_order = {"orderId": self.order_id, "orderUpdateId": 0}
-
-            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
-
-            self.node_states = []
-            self.edge_states = []
-            self.action_states = []
-            self.traversed_node_indices = 0
-
-            # Create node states with released flag based on base_count
-            for i, node_id in enumerate(path):
-                if node_id in NODES:
-                    is_released = (i < base_count)
-                    ns = NodeState(
-                        nodeId=node_id,
-                        sequenceId=i * 2,
-                        released=is_released,
-                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "mapId": MAP_ID}
-                    )
-                    self.node_states.append(ns)
-
-            # Create edge states - edge is released if BOTH its nodes are released
-            for i in range(len(path) - 1):
-                is_released = (i < base_count - 1)  # Edge i connects node i to node i+1
-                es = EdgeState(
-                    edgeId=f"e_{path[i]}_{path[i + 1]}",
-                    sequenceId=i * 2 + 1,
-                    released=is_released,
-                    startNodeId=path[i],
-                    endNodeId=path[i + 1]
-                )
-                self.edge_states.append(es)
-
-            # Only queue the BASE nodes for navigation (not horizon)
-            base_path = path[:base_count]
-
-            if base_path[0] == self.last_node_id:
-                base_path = base_path[1:]
-                self.traversed_node_indices = 1
-
-            if not base_path:
-                if horizon_count > 0:
-                    self.log("⏸ At decision point - waiting for horizon release", "warning")
-                    self.waiting_at_decision_point = True
-                    self.new_base_request = True
-                else:
-                    self.log("Already at destination", "info")
-                return
-
-            self.mission_queue = base_path.copy()
-
-            # Color nodes appropriately
-            for node_id in path[:base_count]:
-                if node_id in self.gui_node_states:
-                    self.gui_node_states[node_id] = "planned"
-
-            self.mission_active = True
-            self.paused = False
-            self.waiting_at_decision_point = False
-
-            # Publish order to MQTT for visibility
-            self._publish_current_order()
-
-            self._advance_mission()
-
-    def release_horizon_node(self, node_id: str = None):
-        """
-        Release the next horizon node(s) to base.
-
-        If node_id is specified, releases up to and including that node.
-        If node_id is None, releases just the next horizon node.
-        """
-        with self.lock:
-            if not self.node_states:
-                self.log("No active order", "warning")
-                return
-
-            # Find horizon nodes
-            horizon_nodes = [(i, ns) for i, ns in enumerate(self.node_states) if not ns.released]
-
-            if not horizon_nodes:
-                self.log("No horizon nodes to release", "info")
-                return
-
-            # Release the first horizon node
-            idx, first_horizon = horizon_nodes[0]
-            first_horizon.released = True
-            self.log(f"✓ Released: {first_horizon.nodeId}", "success")
-
-            # Also release the edge leading to this node
-            for es in self.edge_states:
-                if es.endNodeId == first_horizon.nodeId and not es.released:
-                    es.released = True
-                    self.log(f"   Released edge: {es.edgeId}", "info")
-                    break
-
-            # Increment order update ID (VDA 5050 requirement)
-            self.order_update_id += 1
-            if self.current_order:
-                self.current_order["orderUpdateId"] = self.order_update_id
-
-            # ISSUE 3 FIX: Publish order update on /order topic
-            self._publish_current_order()
-            self.log(f"   📋 Order ID: {self.order_id}, Update ID: {self.order_update_id}", "info")
-
-            # Add released node to mission queue
-            self.mission_queue.append(first_horizon.nodeId)
-            if first_horizon.nodeId in self.gui_node_states:
-                self.gui_node_states[first_horizon.nodeId] = "planned"
-
-            # If we were waiting at decision point, continue
-            if self.waiting_at_decision_point:
-                self.waiting_at_decision_point = False
-                self.new_base_request = False
-                self.log("▶ Continuing mission after horizon release", "success")
-                self._advance_mission()
-
-    # ========================================================================
-    # UTILITY
-    # ========================================================================
-
-    def _next_header_id(self) -> int:
-        self._header_id += 1
-        return self._header_id
-
-    def _get_timestamp(self) -> str:
-        return time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-
-    # ========================================================================
-    # ERROR MANAGEMENT
-    # ========================================================================
-
-    def add_error(self, error_type: str, error_level: str = "WARNING",
-                  error_description: str = "", error_references: List[Dict] = None):
-        """
-        Add an error to the error list.
-
-        Args:
-            error_type: Type of error (e.g., "orderError", "navigationError")
-            error_level: "WARNING" (self-resolving) or "FATAL" (needs intervention)
-            error_description: Human-readable description
-            error_references: List of references to help find cause
-        """
-        error = {
-            "errorType": error_type,
-            "errorLevel": error_level,
-            "errorDescription": error_description,
-            "errorReferences": error_references or []
-        }
-        self.errors.append(error)
-        self.log(f"⚠ Error added: {error_type} ({error_level})", "error")
-
-    def clear_error(self, error_type: str):
-        """Remove an error by type"""
-        self.errors = [e for e in self.errors if e.get("errorType") != error_type]
-
-    def clear_all_errors(self):
-        """Clear all errors"""
-        self.errors = []
-
-    def get_gui_state(self) -> Dict:
-        return {
-            "pose": self.display_pose,
-            "battery": self.battery,
-            "charging": self.charging,
-            "mission_active": self.mission_active,
-            "current_target": self.current_target_node,
-            "gui_node_states": self.gui_node_states,
-            "order_id": self.order_id,
-            "waiting_at_decision_point": self.waiting_at_decision_point,
-        }
-
-    @property
-    def current_order_id(self):
-        """Alias for order_id for GUI compatibility"""
-        return self.order_id
-
     def stop(self):
-        """Stop backend gracefully"""
+        """Stop backend gracefully."""
         self.running = False
         self.mission_active = False
 
-        # Publish OFFLINE before disconnecting
         if self.client and self._connected:
             self._publish_connection_state("OFFLINE", log=True)
-            time.sleep(0.2)  # Allow message to be sent
+            time.sleep(0.2)
 
         if self.client:
             self.client.loop_stop()
@@ -1718,5 +2085,5 @@ class RobotBackend:
         self.log("✓ Backend stopped", "info")
 
 
-# Alias for backward compatibility with GUI
+# Alias for backward compatibility
 VDA5050Backend = RobotBackend
