@@ -34,6 +34,28 @@ from vda_config import (
     MANUFACTURER, SERIAL_NUMBER
 )
 
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def normalize_theta(theta_degrees: float) -> float:
+    """
+    Convert theta from degrees to radians in -π to +π range (VDA 5050 / Flexus convention).
+
+    Input: Valetudo theta in degrees (0 to 360)
+    Output: VDA 5050 theta in radians (-π to +π, i.e., -3.14 to +3.14)
+    """
+    # Step 1: Convert degrees to radians
+    theta_rad = math.radians(theta_degrees)
+
+    # Step 2: Normalize to -π to +π range
+    if theta_rad > math.pi:
+        theta_rad = theta_rad - (2 * math.pi)
+
+    return round(theta_rad, 5)
+
+
 # --- VDA 5050 TOPICS ---
 TOPIC_VISUALIZATION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/visualization"
 TOPIC_INSTANT_ACTIONS = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/instantActions"
@@ -158,7 +180,10 @@ BRIDGE_START_TIME = None
 def check_arrival_and_advance(robot_x, robot_y, is_driving, is_docked):
     """
     Check if robot has arrived at current target node.
-    If arrived and not driving, advance to next node.
+    If arrived and not driving:
+    1. Execute any node actions
+    2. Mark node as traversed
+    3. Advance to next node
     """
     global ORDER_STATE
 
@@ -175,6 +200,7 @@ def check_arrival_and_advance(robot_x, robot_y, is_driving, is_docked):
     target_y = target.get("y", 0)
     target_id = target.get("nodeId", "?")
     target_seq = target.get("sequenceId", 0)
+    target_actions = target.get("actions", [])
 
     # Calculate distance to target
     distance = math.sqrt((robot_x - target_x) ** 2 + (robot_y - target_y) ** 2)
@@ -182,6 +208,11 @@ def check_arrival_and_advance(robot_x, robot_y, is_driving, is_docked):
     # Check if arrived (within tolerance and not driving)
     if distance < ARRIVAL_TOLERANCE_MM and not is_driving:
         print(f"\n✅ ARRIVED at node: {target_id} (seq: {target_seq}, distance: {distance:.0f}mm)")
+
+        # Execute node actions if any (VDA 5050: actions are part of order, not instantActions)
+        if target_actions:
+            print(f"   🎬 Executing {len(target_actions)} node action(s)")
+            execute_node_actions(target_actions)
 
         # Mark as traversed
         ORDER_STATE["traversed_sequence_ids"].add(target_seq)
@@ -201,8 +232,8 @@ def is_already_at_node(node_x, node_y, node_id):
 
     distance = math.sqrt((robot_x - node_x) ** 2 + (robot_y - node_y) ** 2)
 
-    # For home/dock node, also check docked status
-    if node_id.lower() == "home" and ORDER_STATE.get("is_docked", False):
+    # For home/dock node (node "0"), also check docked status
+    if node_id == "0" and ORDER_STATE.get("is_docked", False):
         return True
 
     return distance < AT_NODE_THRESHOLD_MM
@@ -311,10 +342,11 @@ def navigate_to_next_node():
     """
     Navigate to the next released node in the order.
 
-    CRITICAL FIXES:
-    1. Skip nodes already in traversed_sequence_ids
-    2. Check if already at node before sending command
-    3. Don't send dock if already docked
+    VDA 5050 Flow:
+    1. Find next released node not yet traversed
+    2. Navigate to it
+    3. When arrived, execute any node actions
+    4. Then continue to next node
     """
     global ORDER_STATE
 
@@ -341,6 +373,7 @@ def navigate_to_next_node():
 
         node_id = node.get("nodeId", "")
         node_pos = node.get("nodePosition", {})
+        node_actions = node.get("actions", [])
 
         x = node_pos.get("x")
         y = node_pos.get("y")
@@ -352,8 +385,14 @@ def navigate_to_next_node():
 
         # CRITICAL: Check if already at this node
         if is_already_at_node(x, y, node_id):
-            print(f"   ✓ Already at node: {node_id} (seq: {seq_id}) - skipping navigation")
+            print(f"   ✓ Already at node: {node_id} (seq: {seq_id})")
             traversed.add(seq_id)
+
+            # Execute node actions if any
+            if node_actions:
+                print(f"   🎬 Executing {len(node_actions)} node action(s)")
+                execute_node_actions(node_actions)
+
             continue
 
         # Navigate to this node
@@ -363,11 +402,12 @@ def navigate_to_next_node():
             "nodeId": node_id,
             "sequenceId": seq_id,
             "x": x,
-            "y": y
+            "y": y,
+            "actions": node_actions  # Store actions to execute on arrival
         }
 
-        # Handle home/dock node specially
-        if node_id.lower() == "home":
+        # Handle home/dock node (node "0") specially
+        if node_id == "0":
             # Double-check not already docked
             if ORDER_STATE.get("is_docked", False):
                 print(f"   🏠 Already docked - skipping dock command")
@@ -392,6 +432,44 @@ def navigate_to_next_node():
     print(f"   ✅ Order #{ORDER_STATE['order_id']} - all released nodes complete")
     ORDER_STATE["active"] = False
     ORDER_STATE["current_target"] = None
+
+
+def execute_node_actions(actions):
+    """
+    Execute actions attached to a node.
+
+    These are NOT instant actions - they're part of the order.
+    The bridge executes them directly when reaching the node.
+    """
+    for action in actions:
+        action_type = action.get("actionType", "")
+        action_id = action.get("actionId", "")
+
+        print(f"      Executing: {action_type} (id: {action_id})")
+
+        if action_type == "beep":
+            actions_basic.handle_beep(ROBOT_IP)
+        elif action_type == "locate":
+            actions_basic.handle_locate(ROBOT_IP)
+        elif action_type == "dock" or action_type == "quickCharge":
+            if not ORDER_STATE.get("is_docked", False):
+                actions_basic.handle_dock(ROBOT_IP)
+        elif action_type == "startCleaning":
+            actions_basic.handle_start_cleaning(ROBOT_IP)
+        elif action_type == "stopCleaning":
+            actions_basic.handle_stop_cleaning(ROBOT_IP)
+        elif action_type == "pauseCleaning":
+            actions_basic.handle_pause_cleaning(ROBOT_IP)
+        elif action_type == "setFanSpeed":
+            speed = "medium"
+            for param in action.get("actionParameters", []):
+                if param.get("key") == "speed":
+                    speed = param.get("value", "medium")
+            actions_basic.handle_set_fan_speed(ROBOT_IP, speed)
+        else:
+            print(f"      ⚠ Unknown node action: {action_type}")
+
+        time.sleep(0.2)  # Small delay between actions
 
 
 # ============================================================================
@@ -494,7 +572,7 @@ def handle_resume_order():
 
         print(f"   Resuming navigation to: {node_id} at ({x}, {y})")
 
-        if node_id.lower() == "home":
+        if node_id == "0":
             actions_basic.handle_dock(ROBOT_IP)
         else:
             params = [
@@ -563,7 +641,7 @@ def loop_state_and_visualization(mqtt_client):
         if data:
             header_id_counter += 1
             timestamp = time.strftime('%Y-%m-%dT%H:%M:%S.000Z', time.gmtime())
-            theta_vda = round(math.radians(data["theta_deg"]), 5)
+            theta_vda = normalize_theta(data["theta_deg"])
 
             agv_position = {
                 "positionInitialized": True,
@@ -636,8 +714,9 @@ def on_message(client, userdata, msg):
         vda_message = json.loads(payload)
 
         # Check message timestamp - ignore old/retained messages
+        # BUT: Always process instant actions regardless of timestamp
         msg_timestamp = vda_message.get('timestamp', '')
-        if msg_timestamp and BRIDGE_START_TIME:
+        if msg_timestamp and BRIDGE_START_TIME and msg.topic != TOPIC_INSTANT_ACTIONS:
             try:
                 from datetime import datetime
                 msg_time = datetime.fromisoformat(msg_timestamp.replace('Z', '+00:00'))

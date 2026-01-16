@@ -177,7 +177,7 @@ class DashboardApp:
 
         tk.Label(row1, text="θ:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=2, anchor="w").pack(side=tk.LEFT)
         tk.Label(row1, textvariable=self.vars["theta"], bg=COLOR_BG, fg=COLOR_ACCENT,
-                 font=("Arial", 8, "bold"), width=14, anchor="w").pack(side=tk.LEFT)
+                 font=("Arial", 8, "bold"), width=5, anchor="w").pack(side=tk.LEFT)
 
         tk.Label(row1, text="Batt:", bg=COLOR_BG, fg="white", font=("Arial", 8), width=4, anchor="w").pack(side=tk.LEFT)
         tk.Label(row1, textvariable=self.vars["batt"], bg=COLOR_BG, fg=COLOR_ACCENT,
@@ -289,6 +289,38 @@ class DashboardApp:
                   bg="#F44336", fg="white", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
 
         # ============================================================
+        # INSTANT ACTIONS - Compact buttons
+        # ============================================================
+        instant_frame = tk.LabelFrame(sidebar, text="ACTIONS", bg=COLOR_BG, fg="#9C27B0",
+                                      font=("Arial", 10, "bold"))
+        instant_frame.pack(fill=tk.X, pady=2)
+
+        # Row 1: Dock, Locate, Beep, Start Cleaning
+        instant_row1 = tk.Frame(instant_frame, bg=COLOR_BG)
+        instant_row1.pack(fill=tk.X, padx=5, pady=2)
+
+        tk.Button(instant_row1, text="🏠Dock", command=self.send_dock,
+                  bg="#673AB7", fg="white", width=6, font=("Arial", 8)).pack(side=tk.LEFT, padx=1)
+        tk.Button(instant_row1, text="📍Find", command=self.send_locate,
+                  bg="#673AB7", fg="white", width=6, font=("Arial", 8)).pack(side=tk.LEFT, padx=1)
+        tk.Button(instant_row1, text="🔔Beep", command=self.send_beep,
+                  bg="#673AB7", fg="white", width=6, font=("Arial", 8)).pack(side=tk.LEFT, padx=1)
+        tk.Button(instant_row1, text="🧹Clean", command=self.send_start_cleaning,
+                  bg="#673AB7", fg="white", width=6, font=("Arial", 8)).pack(side=tk.LEFT, padx=1)
+
+        # Row 2: Fan Speed (Low, Medium, High, Max)
+        instant_row2 = tk.Frame(instant_frame, bg=COLOR_BG)
+        instant_row2.pack(fill=tk.X, padx=5, pady=2)
+
+        tk.Label(instant_row2, text="Fan:", bg=COLOR_BG, fg="#888",
+                 font=("Arial", 8)).pack(side=tk.LEFT, padx=2)
+
+        for speed in ["low", "medium", "high", "max"]:
+            tk.Button(instant_row2, text=speed.capitalize(),
+                      command=lambda s=speed: self.send_fan_speed(s),
+                      bg="#512DA8", fg="white", width=6, font=("Arial", 8)).pack(side=tk.LEFT, padx=1)
+
+        # ============================================================
         # HORIZON MODE (VDA 5050 Base/Horizon) - REFACTORED WITH BATCH RELEASE
         # ============================================================
         horizon_frame = tk.LabelFrame(sidebar, text="HORIZON MODE", bg=COLOR_BG, fg="#4444AA",
@@ -324,10 +356,10 @@ class DashboardApp:
         self.horizon_spinbox.pack(side=tk.LEFT, padx=5)
 
         tk.Button(horizon_ctrl_row, text="Release", command=self.release_horizon_batch,
-                  bg="#4444AA", fg="white", width=17, font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
+                  bg="#4444AA", fg="white", width=10, font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=5)
 
         tk.Button(horizon_ctrl_row, text="Release All", command=self.release_all_horizon,
-                  bg="#6666CC", fg="white", width=17, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
+                  bg="#6666CC", fg="white", width=10, font=("Arial", 9)).pack(side=tk.LEFT, padx=2)
 
         # ============================================================
         # LOG - Increased height
@@ -455,28 +487,45 @@ class DashboardApp:
         # Get current position
         current_node = self._get_current_node()
 
-        # Get horizon split
-        path_len = len(self.selected_path)
+        # Build full path - ALWAYS include starting node
+        full_path = self.selected_path.copy()
+
+        # If robot is at a node and it's not already the first node in path, prepend it
+        if current_node and (not full_path or full_path[0] != current_node):
+            # Check if current node connects to first selected node
+            if full_path and self._nodes_connected(current_node, full_path[0]):
+                full_path.insert(0, current_node)
+                self.log_message(f"Starting from current position: {current_node}", "info")
+            elif not full_path:
+                # Single destination - prepend current location
+                pass  # Will be handled below
+
+        # Get horizon split (adjust for prepended node if needed)
+        path_len = len(full_path)
         split = min(self.horizon_split.get(), path_len)
 
-        if len(self.selected_path) == 1:
-            # Single node selected - go to it (no horizon concept)
-            target = self.selected_path[0]
+        # Adjust split if we prepended the starting node
+        if current_node and len(full_path) > len(self.selected_path):
+            split = min(split + 1, path_len)  # Include starting node in base
+
+        if len(full_path) == 1:
+            # Single node - just go there
+            target = full_path[0]
             self.log_message(f"Navigate to: {target}", "success")
             self.backend.send_goto_node(target)
-        else:
+        elif len(full_path) >= 2:
             # Multi-node path with base/horizon
-            base_nodes = self.selected_path[:split]
-            horizon_nodes = self.selected_path[split:]
+            base_nodes = full_path[:split]
+            horizon_nodes = full_path[split:]
 
             if horizon_nodes:
                 self.log_message(f"Base: {' → '.join(base_nodes)}", "success")
                 self.log_message(f"Horizon: {' → '.join(horizon_nodes)}", "warning")
             else:
-                self.log_message(f"Execute: {' → '.join(self.selected_path)}", "success")
+                self.log_message(f"Execute: {' → '.join(full_path)}", "success")
 
             # Send mission with horizon split
-            self.backend.set_mission_with_horizon(self.selected_path, split)
+            self.backend.set_mission_with_horizon(full_path, split)
 
         # Clear path after execution
         self.selected_path = []
@@ -505,12 +554,17 @@ class DashboardApp:
         self.undo_last_node()
 
     def _get_current_node(self):
-        """Get the robot's current node (from backend or by position)"""
+        """Get the robot's current node based on actual position"""
+        # First check actual position - most accurate
+        nearest = self.backend._find_nearest_node()
+        if nearest and self.backend._is_at_node(nearest):
+            return nearest
+
+        # Fallback to last known node
         if self.backend.last_node_id:
             return self.backend.last_node_id
 
-        # Find nearest node based on position
-        return self.backend._find_nearest_node()
+        return nearest  # Return nearest even if not exactly at it
 
     # ========================================================================
     # MISSIONS
@@ -527,6 +581,35 @@ class DashboardApp:
         self.backend.emergency_stop()
         self.selected_path = []
         self.update_path_display()
+
+    # ========================================================================
+    # INSTANT ACTIONS
+    # ========================================================================
+
+    def send_dock(self):
+        """Send dock instant action"""
+        self.backend.send_instant_action("dock")
+        self.log_message("🏠 Dock command sent", "info")
+
+    def send_locate(self):
+        """Send locate instant action (robot blinks/speaks)"""
+        self.backend.send_instant_action("locate")
+        self.log_message("📍 Locate command sent", "info")
+
+    def send_beep(self):
+        """Send beep instant action"""
+        self.backend.send_instant_action("beep")
+        self.log_message("🔔 Beep command sent", "info")
+
+    def send_start_cleaning(self):
+        """Send startCleaning instant action"""
+        self.backend.send_instant_action("startCleaning")
+        self.log_message("🧹 Start cleaning command sent", "info")
+
+    def send_fan_speed(self, speed: str):
+        """Send setFanSpeed instant action"""
+        self.backend.send_fan_speed(speed)
+        self.log_message(f"🌀 Fan speed: {speed}", "info")
 
     # ========================================================================
     # HORIZON MODE - BATCH RELEASE (REFACTORED)
@@ -860,6 +943,11 @@ class DashboardApp:
                 fill = "#555"  # Hover highlight
                 outline_color = "#888"
                 outline_width = 2
+            elif name == current_node:
+                # ROBOT IS HERE - highlight prominently (even without mission)
+                fill = COLOR_NODE_DONE  # Green
+                outline_color = "#00FF00"  # Bright green outline
+                outline_width = 3
             elif self.backend.gui_node_states.get(name) == "done":
                 # Traversed during active mission - GREEN
                 fill = COLOR_NODE_DONE  # Green

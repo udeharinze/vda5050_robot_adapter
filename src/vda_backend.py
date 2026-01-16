@@ -56,6 +56,27 @@ TOPIC_VISUALIZATION = f"uagv/v2/{MANUFACTURER}/{SERIAL_NUMBER}/visualization"
 
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def normalize_theta(theta_degrees: float) -> float:
+    """
+    Convert theta from degrees to radians in -π to +π range (VDA 5050 / Flexus convention).
+
+    Input: Valetudo theta in degrees (0 to 360)
+    Output: VDA 5050 theta in radians (-π to +π, i.e., -3.14 to +3.14)
+    """
+    # Step 1: Convert degrees to radians
+    theta_rad = math.radians(theta_degrees)
+
+    # Step 2: Normalize to -π to +π range
+    if theta_rad > math.pi:
+        theta_rad = theta_rad - (2 * math.pi)
+
+    return theta_rad
+
+
+# ============================================================================
 # ENUMS
 # ============================================================================
 
@@ -102,6 +123,11 @@ class NodeState:
     nodePosition: Optional[Dict] = None
     actions: List[Dict] = field(default_factory=list)
 
+    def __post_init__(self):
+        """Ensure nodePosition has theta=0.0 if nodePosition exists (per VDA 5050)"""
+        if self.nodePosition and "theta" not in self.nodePosition:
+            self.nodePosition["theta"] = 0.0
+
     def to_dict(self) -> Dict:
         result = {
             "nodeId": self.nodeId,
@@ -147,8 +173,8 @@ class RobotBackend:
         self._connected = False
 
         # Robot state - Initialize at home position
-        home_x = NODES.get("home", {}).get("x", 0.0)
-        home_y = NODES.get("home", {}).get("y", 0.0)
+        home_x = NODES.get("0", {}).get("x", 0.0)
+        home_y = NODES.get("0", {}).get("y", 0.0)
 
         self.pose = {"x": home_x, "y": home_y, "theta": 0.0}
         self.display_pose = {"x": home_x, "y": home_y, "theta": 0.0}
@@ -169,8 +195,11 @@ class RobotBackend:
         self._order_id_counter: int = 0  # Counter for generating unique order IDs
 
         # CRITICAL: Track last node state for stitching validation
-        self.last_node_id: Optional[str] = None
+        self.last_node_id: Optional[str] = None  # Internal node name (e.g., "node1")
         self.last_node_sequence_id: int = 0
+
+        # Track the node robot is currently AT (for nodeStates - don't remove until we leave)
+        self._current_node_sequence_id: Optional[int] = None
 
         # CRITICAL: Global sequence counter - NEVER reset during order updates
         self._global_sequence_id: int = 0
@@ -413,7 +442,7 @@ class RobotBackend:
     # ========================================================================
 
     def _sync_initial_position(self):
-        """Sync last_node_id with robot's actual position on startup"""
+        """Sync last_node_id and nodeStates with robot's actual position on startup"""
         nearest = self._find_nearest_node()
         if nearest:
             node_data = NODES.get(nearest)
@@ -425,6 +454,20 @@ class RobotBackend:
                 if dist < ARRIVAL_TOLERANCE_MM:
                     self.last_node_id = nearest
                     self.log(f"📍 Initial position: at node '{nearest}'", "info")
+
+                    # Initialize nodeStates with current node
+                    ns = NodeState(
+                        nodeId=nearest,
+                        sequenceId=0,
+                        released=True,
+                        nodePosition={"x": node_data["x"], "y": node_data["y"], "theta": 0, "mapId": MAP_ID}
+                    )
+                    self.node_states = [ns]
+                    self._current_node_sequence_id = 0
+
+                    # Mark in GUI
+                    if nearest in self.gui_node_states:
+                        self.gui_node_states[nearest] = "done"
                 else:
                     self.last_node_id = nearest
                     self.log(f"📍 Initial position: near node '{nearest}' (dist={dist:.0f}mm)", "info")
@@ -699,6 +742,7 @@ class RobotBackend:
         self.edge_states = []
         self.mission_queue = []
         self._traversed_sequence_ids = set()
+        self._current_node_sequence_id = None  # Reset current node tracking
 
         # Parse nodes
         nodes = order.get("nodes", [])
@@ -933,19 +977,33 @@ class RobotBackend:
         self._publish_current_order(is_update=True)
 
     def _build_mission_queue(self):
-        """Build mission queue from released nodes, excluding traversed ones."""
+        """Build mission queue from released nodes, excluding traversed and current node."""
         self.mission_queue = []
         for ns in self.node_states:
-            if ns.released and ns.sequenceId not in self._traversed_sequence_ids:
+            # Skip traversed nodes (robot has left)
+            if ns.sequenceId in self._traversed_sequence_ids:
+                continue
+            # Skip current node (robot is at)
+            if self._current_node_sequence_id is not None and ns.sequenceId == self._current_node_sequence_id:
+                continue
+            # Add released nodes to queue
+            if ns.released:
                 self.mission_queue.append((ns.nodeId, ns.sequenceId))
                 if ns.nodeId in self.gui_node_states:
                     self.gui_node_states[ns.nodeId] = "planned"
 
     def _mark_node_traversed(self, node_id: str, sequence_id: int):
-        """Mark a node as traversed."""
-        self._traversed_sequence_ids.add(sequence_id)
+        """
+        Mark robot as being AT this node (for cases when already at node at mission start).
+
+        Sets current node tracking. The node will be removed from nodeStates
+        when the robot physically LEAVES it (detected in main loop).
+        """
+        # Set this as the current node
+        self._current_node_sequence_id = sequence_id
         self.last_node_id = node_id
         self.last_node_sequence_id = sequence_id
+
         if node_id in self.gui_node_states:
             self.gui_node_states[node_id] = "done"
 
@@ -1020,49 +1078,49 @@ class RobotBackend:
             self._send_navigation_command(next_node_id, next_seq_id)
 
     def _send_navigation_command(self, node_id: str, sequence_id: int):
-        """Send navigation command - publishes order for bridge to handle."""
+        """
+        Send navigation command for order-based navigation.
+
+        NOTE: This does NOT send commands via instantActions!
+        The order is published to /order topic, and the bridge handles navigation.
+        For node "0" (home), the bridge will send the dock command to the robot.
+        """
         self.last_command_ts = time.time()
 
-        # FIX: Only send dock command if NOT already at home
-        if node_id == "home":
-            if self._is_at_node("home"):
-                self.log(f"🏠 Already at home, skipping dock command", "info")
-                self._on_node_reached(node_id, sequence_id)
-                return
-            else:
-                self.log(f"🏠 Navigating to: home (dock command)", "info")
-                self._send_dock_command()
-        else:
-            self._send_goto(node_id)
-
-    def _send_goto(self, node_id: str):
-        """Send navigation command for bridge to execute.
-
-        NOTE: This does NOT publish the order - caller is responsible for publishing.
-        The order is published by set_mission_sequence/set_mission_with_horizon/release_horizon_nodes.
-        """
+        # Get target position for logging
         target = None
+        if node_id in NODES:
+            target = {"x": NODES[node_id]["x"], "y": NODES[node_id]["y"]}
 
-        for ns in self.node_states:
-            if ns.nodeId == node_id and ns.nodePosition:
-                pos = ns.nodePosition
-                if pos.get("x") is not None and pos.get("y") is not None:
-                    target = {"x": pos["x"], "y": pos["y"]}
-                    break
-
-        if not target and node_id in NODES:
-            node_config = NODES[node_id]
-            target = {"x": node_config["x"], "y": node_config["y"]}
-
-        if not target:
-            self.log(f"✗ Unknown node: {node_id}", "error")
+        # Check if already at target node
+        if self._is_at_node(node_id):
+            if node_id == "0":
+                self.log(f"🏠 Already at home (node 0)", "info")
+            else:
+                self.log(f"✓ Already at node {node_id}", "info")
+            self._on_node_reached(node_id, sequence_id)
             return
 
-        self.log(f"🎯 Navigating to: {node_id} ({int(target['x'])}, {int(target['y'])})", "info")
-        # NOTE: Order is NOT published here - it's already published by the caller
+        # Log navigation intent - the bridge handles actual navigation
+        if node_id == "0":
+            self.log(f"🚀 GoTo: home (dock) [seq: {sequence_id}]", "info")
+        elif target:
+            self.log(f"🚀 GoTo: {node_id} ({int(target['x'])}, {int(target['y'])}) [seq: {sequence_id}]", "info")
+        else:
+            self.log(f"🚀 GoTo: {node_id} [seq: {sequence_id}]", "info")
+
+        # NOTE: No instantAction is sent here!
+        # The order was already published to /order topic.
+        # The bridge reads the order and handles navigation.
 
     def _send_dock_command(self):
-        """Send dock command via instant actions."""
+        """
+        Send dock command via instant actions.
+
+        NOTE: This is ONLY for instant action dock requests (not part of an order).
+        When dock is part of an order (node "0"), the bridge handles it.
+        """
+        self.log(f"🏠 Sending dock instant action", "info")
         action_msg = {
             "headerId": self._next_header_id(),
             "timestamp": self._get_timestamp(),
@@ -1079,21 +1137,48 @@ class RobotBackend:
         self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def _complete_mission(self):
-        """Complete mission."""
+        """
+        Complete mission.
+
+        VDA 5050: When order completes:
+        - nodeStates contains the last node (where robot stopped)
+        - lastNodeId shows where robot stopped
+        - Order ID is kept until new order arrives
+        """
         self.log(f"✅ ORDER COMPLETE: Order #{self.order_id}", "success")
         self.mission_active = False
         self.current_target_node = None
         self.waiting_at_decision_point = False
         self.new_base_request = False
 
-        # Clear states but KEEP orderId/orderUpdateId per VDA 5050
-        self.node_states = []
+        # Keep ONLY the last (current) node in nodeStates
+        # Robot is at this node, so it stays in nodeStates
+        current_node = self.last_node_id
+        if current_node and current_node in NODES:
+            ns = NodeState(
+                nodeId=current_node,
+                sequenceId=0,
+                released=True,
+                nodePosition={"x": NODES[current_node]["x"], "y": NODES[current_node]["y"], "theta": 0, "mapId": MAP_ID}
+            )
+            self.node_states = [ns]
+        else:
+            self.node_states = []
+
+        # Clear edges (all traversed)
         self.edge_states = []
         self.action_states = []
+
+        # Reset traversal tracking
         self._traversed_sequence_ids = set()
+        self._current_node_sequence_id = 0 if self.node_states else None
 
         self.log(f"   📋 Keeping Order #{self.order_id} until new order arrives", "info")
         self._reset_gui_colors()
+
+        # Mark current node as where robot is
+        if self.last_node_id and self.last_node_id in self.gui_node_states:
+            self.gui_node_states[self.last_node_id] = "done"
 
     def _is_at_node(self, node_id: str) -> bool:
         """Check if robot is at specified node."""
@@ -1120,10 +1205,22 @@ class RobotBackend:
         return dist < ARRIVAL_TOLERANCE_MM
 
     def _on_node_reached(self, node_id: str, sequence_id: int):
-        """Node reached - execute actions and advance."""
-        self.log(f"✓ ARRIVED: {node_id} (seq: {sequence_id})", "success")
+        """
+        Node reached - update tracking and advance mission.
 
-        self._mark_node_traversed(node_id, sequence_id)
+        NOTE: Node traversal (removal from nodeStates) is handled in main loop
+        when robot LEAVES a node. This method just updates current position.
+        """
+        # Update current node - robot is now AT this node
+        self._current_node_sequence_id = sequence_id
+
+        # Update lastNodeId tracking
+        self.last_node_id = node_id
+        self.last_node_sequence_id = sequence_id
+
+        # Update GUI state
+        if node_id in self.gui_node_states:
+            self.gui_node_states[node_id] = "done"
 
         # Remove incoming edge from edgeStates
         incoming_edge_seq_id = sequence_id - 1
@@ -1263,16 +1360,22 @@ class RobotBackend:
         nearest = self._find_nearest_node()
         if nearest and self._is_at_node(nearest):
             self.last_node_id = nearest
-            for ns in self.node_states:
-                if ns.nodeId == nearest:
-                    self.last_node_sequence_id = ns.sequenceId
-                    break
             self.log(f"   Updated lastNodeId: {self.last_node_id}", "info")
 
-        # 6. Clear nodeStates and edgeStates (delete states of previous order)
-        self.node_states = []
+        # 6. Set nodeStates to contain ONLY the current node (where robot stopped)
+        current_node = self.last_node_id
+        if current_node and current_node in NODES:
+            ns = NodeState(
+                nodeId=current_node,
+                sequenceId=0,
+                released=True,
+                nodePosition={"x": NODES[current_node]["x"], "y": NODES[current_node]["y"], "theta": 0, "mapId": MAP_ID}
+            )
+            self.node_states = [ns]
+        else:
+            self.node_states = []
         self.edge_states = []
-        self.log(f"   Cleared nodeStates and edgeStates", "info")
+        self.log(f"   nodeStates updated to current position: {current_node}", "info")
 
         # Mission state cleanup
         self.mission_active = False
@@ -1283,6 +1386,7 @@ class RobotBackend:
         self.waiting_at_decision_point = False
         self.new_base_request = False
         self._traversed_sequence_ids = set()
+        self._current_node_sequence_id = 0 if self.node_states else None
 
         # 7. actionStates are KEPT (per VDA 5050)
         # (We don't clear self.action_states)
@@ -1296,6 +1400,10 @@ class RobotBackend:
         self.log(f"   📋 Kept Order #{self.order_id} (updateId: {self.order_update_id}) [cancelled]", "info")
 
         self._reset_gui_colors()
+
+        # Mark current node as where robot is
+        if self.last_node_id and self.last_node_id in self.gui_node_states:
+            self.gui_node_states[self.last_node_id] = "done"
 
     # ========================================================================
     # ACTION EXECUTION
@@ -1326,7 +1434,13 @@ class RobotBackend:
             self._execute_single_action(action, wait=True)
 
     def _execute_single_action(self, action: Dict, wait: bool = True):
-        """Execute a single action."""
+        """
+        Execute a single node action.
+
+        NOTE: Node actions are NOT sent via instantActions!
+        They are part of the order, and the bridge executes them directly.
+        This method only tracks the action state for VDA 5050 state reporting.
+        """
         action_type = action.get("actionType", "")
         action_id = action.get("actionId", "")
         blocking_type = action.get("blockingType", "HARD")
@@ -1334,19 +1448,16 @@ class RobotBackend:
         self.log(f"🎬 Action: {action_type} [{blocking_type}]", "info")
         self._update_action_state(action_id, "RUNNING")
 
-        success = True
-        self._send_action_to_bridge(action)
+        # NOTE: We do NOT send to bridge here!
+        # The bridge reads node actions from the order and executes them directly.
+        # We just simulate the delay and update state.
 
-        if wait and success:
+        if wait:
             action_delay = self._get_action_delay(action_type)
             time.sleep(action_delay)
 
-        if success:
-            self._update_action_state(action_id, "FINISHED")
-            self.log(f"   ✓ {action_type} finished", "success")
-        else:
-            self._update_action_state(action_id, "FAILED", "Action failed")
-            self.log(f"   ✗ {action_type} failed", "error")
+        self._update_action_state(action_id, "FINISHED")
+        self.log(f"   ✓ {action_type} finished", "success")
 
     def _get_action_delay(self, action_type: str) -> float:
         """Get delay time for action completion."""
@@ -1362,18 +1473,6 @@ class RobotBackend:
             "quickCharge": 0.5,
         }
         return delays.get(action_type, 0.5)
-
-    def _send_action_to_bridge(self, action: Dict):
-        """Send action to bridge for execution."""
-        action_msg = {
-            "headerId": self._next_header_id(),
-            "timestamp": self._get_timestamp(),
-            "version": VDA_VERSION,
-            "manufacturer": MANUFACTURER,
-            "serialNumber": SERIAL_NUMBER,
-            "actions": [action]
-        }
-        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
 
     def _update_action_state(self, action_id: str, status: str, result: str = ""):
         """Update action state."""
@@ -1393,10 +1492,18 @@ class RobotBackend:
         if not self.client:
             return
 
-        # Build remaining nodeStates (not traversed)
+        # Build remaining nodeStates
+        # VDA 5050: Only remove nodes that robot has LEFT (fully traversed)
+        # The current node robot is AT should remain in nodeStates
         remaining_node_states = []
         for ns in self.node_states:
+            # Keep node if:
+            # 1. Not in traversed set (not yet visited), OR
+            # 2. It's the current node we're AT
             if ns.sequenceId not in self._traversed_sequence_ids:
+                remaining_node_states.append(ns.to_dict())
+            elif self._current_node_sequence_id is not None and ns.sequenceId == self._current_node_sequence_id:
+                # This is the current node - keep it
                 remaining_node_states.append(ns.to_dict())
 
         remaining_edge_states = [es.to_dict() for es in self.edge_states]
@@ -1423,7 +1530,7 @@ class RobotBackend:
             "agvPosition": {
                 "x": self.pose["x"],
                 "y": self.pose["y"],
-                "theta": self.pose["theta"],
+                "theta": self.pose["theta"],  # Already in radians from bridge
                 "mapId": MAP_ID,
                 "positionInitialized": True
             },
@@ -1437,10 +1544,30 @@ class RobotBackend:
                 "fieldViolation": False
             },
             "errors": self.errors,
-            "informations": []
+            "information": []
         }
 
         self.client.publish(TOPIC_STATE, json.dumps(state))
+
+        # Also publish to visualization topic (lightweight position update)
+        visualization = {
+            "headerId": self._header_id,
+            "timestamp": self._get_timestamp(),
+            "version": VDA_VERSION,
+            "manufacturer": MANUFACTURER,
+            "serialNumber": SERIAL_NUMBER,
+            "agvPosition": {
+                "positionInitialized": True,
+                "localizationScore": 1.0,
+                "deviationRange": 0.0,
+                "x": self.pose["x"],
+                "y": self.pose["y"],
+                "theta": self.pose["theta"],
+                "mapId": MAP_ID
+            },
+            "velocity": {"vx": 0.0, "vy": 0.0, "omega": 0.0}
+        }
+        self.client.publish(TOPIC_VISUALIZATION, json.dumps(visualization))
 
     def _publish_current_order(self, is_update: bool = None):
         """
@@ -1462,39 +1589,38 @@ class RobotBackend:
 
         # Find nodes to publish
         if is_update:
-            # For updates: Find stitch point = LAST TRAVERSED node
-            # This is "the last node of the previous base"
-            stitch_seq_id = None
-            for ns in self.node_states:
-                if ns.sequenceId in self._traversed_sequence_ids:
-                    stitch_seq_id = ns.sequenceId  # Keep updating to find the LAST one
+            # VDA 5050 ORDER UPDATE LOGIC:
+            # The stitch point is the CURRENT node (where robot is waiting at decision point)
+            # We publish: [stitch_node, newly_released_nodes...]
+            # We do NOT include already traversed nodes
+
+            stitch_seq_id = self._current_node_sequence_id
 
             if stitch_seq_id is None:
-                # No traversed nodes - shouldn't happen for a valid update
-                # Fall back to first released node
-                for ns in self.node_states:
-                    if ns.released:
-                        stitch_seq_id = ns.sequenceId
-                        break
+                # Fallback: use last_node_sequence_id
+                stitch_seq_id = self.last_node_sequence_id
 
             if stitch_seq_id is None:
-                # Still no stitch point - publish all
+                # Still no stitch point - publish all (shouldn't happen)
                 nodes_to_publish = self.node_states
                 edges_to_publish = self.edge_states
                 self.log("⚠ No stitch point found, publishing all nodes", "warning")
             else:
-                # Publish from stitch point onwards (stitch node + everything after)
+                # Publish from stitch point onwards ONLY
+                # This excludes all traversed nodes
                 nodes_to_publish = [ns for ns in self.node_states
                                     if ns.sequenceId >= stitch_seq_id]
 
-                # Get corresponding edges
-                # Edge leading TO stitch node has seq = stitch_seq - 1
-                # We DON'T include that edge (it's already traversed)
-                # We include edges from stitch node onwards (seq >= stitch_seq + 1)
-                # Actually, we include edges that connect published nodes
-                min_edge_seq = stitch_seq_id + 1  # First edge AFTER stitch node
+                # Edges: start from edge AFTER stitch node
+                min_edge_seq = stitch_seq_id + 1
                 edges_to_publish = [es for es in self.edge_states
                                     if es.sequenceId >= min_edge_seq]
+
+                # Log which nodes are being published
+                all_node_ids = [f"{ns.nodeId}(seq{ns.sequenceId})" for ns in self.node_states]
+                pub_node_ids = [f"{ns.nodeId}(seq{ns.sequenceId})" for ns in nodes_to_publish]
+                self.log(f"   📦 All nodes: {', '.join(all_node_ids)}", "info")
+                self.log(f"   📦 Stitch seq: {stitch_seq_id}, Publishing: {', '.join(pub_node_ids)}", "info")
         else:
             # For new orders: Publish all
             nodes_to_publish = self.node_states
@@ -1546,7 +1672,7 @@ class RobotBackend:
         self.client.publish(TOPIC_ORDER, json.dumps(order))
 
         if is_update:
-            self.log(f"📤 Order UPDATE published (stitch + {len(nodes_list)} nodes)", "info")
+            self.log(f"📤 Order UPDATE #{self.order_update_id} ({len(nodes_list)} nodes)", "info")
         else:
             self.log(f"📤 Order published ({len(nodes_list)} nodes)", "info")
 
@@ -1674,6 +1800,7 @@ class RobotBackend:
             self.edge_states = []
             self.action_states = []
             self._traversed_sequence_ids = set()
+            self._current_node_sequence_id = None  # Reset current node tracking
 
             # Create nodes with stable sequenceIds
             for i, node_id in enumerate(path):
@@ -1682,7 +1809,7 @@ class RobotBackend:
                         nodeId=node_id,
                         sequenceId=i * 2,
                         released=True,
-                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "mapId": MAP_ID}
+                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "theta": 0, "mapId": MAP_ID}
                     )
                     self.node_states.append(ns)
 
@@ -1755,6 +1882,7 @@ class RobotBackend:
             self.edge_states = []
             self.action_states = []
             self._traversed_sequence_ids = set()
+            self._current_node_sequence_id = None  # Reset current node tracking
 
             # Create node states with released flag
             for i, node_id in enumerate(path):
@@ -1764,7 +1892,7 @@ class RobotBackend:
                         nodeId=node_id,
                         sequenceId=i * 2,
                         released=is_released,
-                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "mapId": MAP_ID}
+                        nodePosition={"x": NODES[node_id]["x"], "y": NODES[node_id]["y"], "theta": 0, "mapId": MAP_ID}
                     )
                     self.node_states.append(ns)
 
@@ -1885,34 +2013,119 @@ class RobotBackend:
     # ========================================================================
 
     def _main_loop(self):
-        """Main loop."""
+        """
+        Main loop - handles arrival detection and node traversal tracking.
+
+        KEY LOGIC:
+        1. Check if robot has LEFT current node (moved away) → mark as traversed
+        2. Check if robot has ARRIVED at target node → advance mission
+        """
         while self.running:
             time.sleep(0.1)
 
             self._update_animation()
 
+            # ============================================================
+            # CONTINUOUS POSITION TRACKING
+            # Always track which node the robot is at, even without active mission
+            # This ensures lastNodeId reflects actual robot position
+            # ============================================================
+            self._update_current_node_from_position()
+
+            # Publish state periodically
             if time.time() - self.last_state_publish_ts > STATE_PUBLISH_INTERVAL:
                 self._publish_state()
                 self.last_state_publish_ts = time.time()
 
+            # Publish connection state periodically
             if time.time() - self.last_connection_publish_ts > CONNECTION_PUBLISH_INTERVAL:
                 self._publish_connection_state("ONLINE")
                 self.last_connection_publish_ts = time.time()
 
+            # ============================================================
+            # NODE TRAVERSAL DETECTION (during active mission)
+            # Check if robot has LEFT the current node (moved away from it)
+            # If so, mark it as traversed IMMEDIATELY
+            # ============================================================
+            if self._current_node_sequence_id is not None and self.mission_active:
+                current_node_id = self._get_node_id_for_sequence(self._current_node_sequence_id)
+                if current_node_id and not self._is_at_node(current_node_id):
+                    # Robot has LEFT the current node - mark as traversed
+                    self._traversed_sequence_ids.add(self._current_node_sequence_id)
+                    self.log(f"↗ LEFT node {current_node_id} (seq: {self._current_node_sequence_id})", "info")
+
+                    # Clear current node - we're now in transit
+                    self._current_node_sequence_id = None
+
+            # Skip mission logic if not active
             if not self.mission_active or not self.current_target_node:
                 continue
 
             if self.paused or self.waiting_at_decision_point:
                 continue
 
-            # Check arrival
+            # ============================================================
+            # ARRIVAL DETECTION
+            # Check if robot has arrived at target node
+            # ============================================================
             if self._is_at_node(self.current_target_node) and not self.is_driving:
+                self.log(f"✓ ARRIVED at {self.current_target_node} (seq: {self.current_target_sequence_id})", "success")
                 self._on_node_reached(self.current_target_node,
                                       self.current_target_sequence_id or 0)
             elif time.time() - self.last_command_ts > STALLED_TIMEOUT_SEC and not self.is_driving:
-                self.log(f"⚠ Stalled, retrying...", "warning")
+                self.log(f"⚠ Stalled, retrying navigation...", "warning")
                 self._send_navigation_command(self.current_target_node,
                                               self.current_target_sequence_id or 0)
+
+    def _get_node_id_for_sequence(self, sequence_id: int) -> Optional[str]:
+        """Get node ID for a given sequence ID from node_states."""
+        for ns in self.node_states:
+            if ns.sequenceId == sequence_id:
+                return ns.nodeId
+        return None
+
+    def _update_current_node_from_position(self):
+        """
+        Continuously track which node the robot is at based on its actual position.
+        Updates lastNodeId and nodeStates to reflect where the robot actually is,
+        even if moved outside of GUI control (e.g., via Valetudo).
+
+        nodeStates should ALWAYS contain the current node the robot is at.
+        """
+        # Find which node the robot is currently at
+        current_node = self._find_nearest_node()
+
+        if current_node and self._is_at_node(current_node):
+            # Robot is at a known node
+            if self.last_node_id != current_node:
+                # Position changed - update lastNodeId
+                old_node = self.last_node_id
+                self.last_node_id = current_node
+
+                # Log position change when not in active mission
+                if not self.mission_active:
+                    self.log(f"📍 Robot moved to node: {current_node}", "info")
+
+                    # Update nodeStates to contain ONLY the current node
+                    # (robot moved outside of mission control)
+                    ns = NodeState(
+                        nodeId=current_node,
+                        sequenceId=0,
+                        released=True,
+                        nodePosition={"x": NODES[current_node]["x"], "y": NODES[current_node]["y"], "theta": 0,
+                                      "mapId": MAP_ID}
+                    )
+                    self.node_states = [ns]
+                    self.edge_states = []
+                    self._traversed_sequence_ids = set()
+                    self._current_node_sequence_id = 0
+
+                    # Reset ALL GUI node colors to idle
+                    self._reset_gui_colors()
+
+                # Mark current node as where robot is
+                if current_node in self.gui_node_states:
+                    self.gui_node_states[current_node] = "done"  # Green = robot is here
 
     # ========================================================================
     # UTILITY
@@ -2069,6 +2282,42 @@ class RobotBackend:
             }
             self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
             self.log(f"📤 Instant action: {actual_action}", "info")
+
+    def send_fan_speed(self, speed: str):
+        """
+        Send setFanSpeed instant action.
+
+        Valid speeds: "off", "low", "medium", "high", "max"
+        """
+        # Map common names to Valetudo fan speed presets
+        speed_map = {
+            "off": "off",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "max": "max",
+            "turbo": "max"
+        }
+
+        actual_speed = speed_map.get(speed.lower(), "medium")
+
+        action_msg = {
+            "headerId": self._next_header_id(),
+            "timestamp": self._get_timestamp(),
+            "version": VDA_VERSION,
+            "manufacturer": MANUFACTURER,
+            "serialNumber": SERIAL_NUMBER,
+            "actions": [{
+                "actionType": "setFanSpeed",
+                "actionId": self._next_action_id("fanSpeed"),
+                "blockingType": "NONE",
+                "actionParameters": [
+                    {"key": "speed", "value": actual_speed}
+                ]
+            }]
+        }
+        self.client.publish(TOPIC_INSTANT_ACTIONS, json.dumps(action_msg))
+        self.log(f"📤 Fan speed: {actual_speed}", "info")
 
     def stop(self):
         """Stop backend gracefully."""
